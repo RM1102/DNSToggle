@@ -1,0 +1,13 @@
+.build/
+*.app/
+.DS_Store
+*.dSYM/
+MenuBar/dns
+.venv/
+.venvs/
+*.pyc
+__pycache__/
+research_ambit_probe/results/
+.env
+*.pem
+*.key

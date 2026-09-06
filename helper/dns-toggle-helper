@@ -1,0 +1,101 @@
+#!/bin/bash
+# Privileged helper for DNS.app — only known presets, no arbitrary commands.
+set -euo pipefail
+
+PROXY_PORT="3128"
+
+usage() {
+  echo "usage: $0 {ping|cloudflare|google|quad9|opendns|adguard|controld|mullvad|auto|clear|proxy-on|proxy62-on|proxy22-on|proxy-off}" >&2
+  exit 1
+}
+
+flush_dns() {
+  /usr/bin/dscacheutil -flushcache
+  /usr/bin/killall -HUP mDNSResponder 2>/dev/null || true
+}
+
+active_services() {
+  /usr/sbin/networksetup -listallnetworkservices | awk 'NR>1 && $0 !~ /^\*/'
+}
+
+apply_dns() {
+  while IFS= read -r svc; do
+    [ -z "$svc" ] && continue
+    /usr/sbin/networksetup -setdnsservers "$svc" "$@"
+  done < <(active_services)
+}
+
+clear_proxies() {
+  while IFS= read -r svc; do
+    [ -z "$svc" ] && continue
+    /usr/sbin/networksetup -setwebproxystate "$svc" off
+    /usr/sbin/networksetup -setsecurewebproxystate "$svc" off
+    /usr/sbin/networksetup -setsocksfirewallproxystate "$svc" off
+    /usr/sbin/networksetup -setautoproxystate "$svc" off
+  done < <(active_services)
+}
+
+enable_iitd_proxy() {
+  local host="$1"
+  while IFS= read -r svc; do
+    [ -z "$svc" ] && continue
+    /usr/sbin/networksetup -setwebproxy "$svc" "$host" "$PROXY_PORT" off
+    /usr/sbin/networksetup -setsecurewebproxy "$svc" "$host" "$PROXY_PORT" off
+    /usr/sbin/networksetup -setwebproxystate "$svc" on
+    /usr/sbin/networksetup -setsecurewebproxystate "$svc" on
+    /usr/sbin/networksetup -setsocksfirewallproxystate "$svc" off
+    /usr/sbin/networksetup -setautoproxystate "$svc" off
+  done < <(active_services)
+}
+
+[ $# -ge 1 ] || usage
+
+case "$1" in
+  ping)
+    echo ok
+    exit 0
+    ;;
+  cloudflare)
+    apply_dns 1.1.1.1 1.0.0.1
+    ;;
+  google)
+    apply_dns 8.8.8.8 8.8.4.4
+    ;;
+  quad9)
+    apply_dns 9.9.9.9 149.112.112.112
+    ;;
+  opendns)
+    apply_dns 208.67.222.222 208.67.220.220
+    ;;
+  adguard)
+    apply_dns 94.140.14.14 94.140.15.15
+    ;;
+  controld)
+    apply_dns 76.76.2.0 76.76.10.0
+    ;;
+  mullvad)
+    apply_dns 194.242.2.2 194.242.2.3
+    ;;
+  auto)
+    apply_dns Empty
+    ;;
+  clear)
+    apply_dns Empty
+    clear_proxies
+    ;;
+  proxy-on|proxy62-on)
+    enable_iitd_proxy "proxy62.iitd.ac.in"
+    ;;
+  proxy22-on)
+    enable_iitd_proxy "proxy22.iitd.ac.in"
+    ;;
+  proxy-off)
+    clear_proxies
+    ;;
+  *)
+    usage
+    ;;
+esac
+
+flush_dns
+echo ok

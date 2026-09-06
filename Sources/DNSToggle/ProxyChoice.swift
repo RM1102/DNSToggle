@@ -37,8 +37,10 @@ enum ProxyChoice: String, CaseIterable, Identifiable {
     var cgiURL: String { "https://\(host)/cgi-bin/proxy.cgi" }
 }
 
+/// User intent + last selected proxy. Watchdog keeps CGI in sync with this.
 enum ProxySelection {
     private static let selectedProxyDefaultsKey = "iitdSelectedProxy"
+    private static let desiredOnDefaultsKey = "iitdDesiredProxyOn"
 
     static var current: ProxyChoice {
         if let raw = UserDefaults.standard.string(forKey: selectedProxyDefaultsKey),
@@ -50,5 +52,20 @@ enum ProxySelection {
 
     static func set(_ choice: ProxyChoice) {
         UserDefaults.standard.set(choice.rawValue, forKey: selectedProxyDefaultsKey)
+    }
+
+    /// True when the user wants institute proxy kept logged in (survives relaunch).
+    static var desiredOn: Bool {
+        get { UserDefaults.standard.bool(forKey: desiredOnDefaultsKey) }
+        set { UserDefaults.standard.set(newValue, forKey: desiredOnDefaultsKey) }
+    }
+
+    static func markDesiredOn(_ choice: ProxyChoice) {
+        set(choice)
+        desiredOn = true
+    }
+
+    static func markDesiredOff() {
+        desiredOn = false
     }
 }

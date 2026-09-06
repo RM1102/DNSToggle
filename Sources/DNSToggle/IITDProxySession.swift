@@ -3,11 +3,14 @@ import Combine
 
 /// Keepalive interval — official scripts often use 60–120s; 60s is safer against idle drop.
 private let refreshIntervalSeconds: TimeInterval = 60
-private let maxConsecutiveFailures = 2
+/// Soft failures before we clear system proxy (was 2 — too aggressive for campus Wi‑Fi blips).
+private let maxConsecutiveFailures = 5
+private let softRetryBaseSeconds: TimeInterval = 8
 
 /// CGI login + keepalive for proxy22 / proxy62.
 /// Critical rule: if the CGI session dies while macOS still has HTTP(S) proxy set,
-/// every app hangs. Always clear the system proxy when we cannot restore the session.
+/// every app hangs. Clear system proxy only after soft retries are exhausted —
+/// ProxyWatchdog will re-arm later if the user still wants proxy on.
 final class IITDProxySession: ObservableObject {
     static let shared = IITDProxySession()
 
@@ -28,7 +31,7 @@ final class IITDProxySession: ObservableObject {
 
     // MARK: public API
 
-    func start(proxy: ProxyChoice) {
+    func start(proxy: ProxyChoice, reason: String = "manual") {
         stateQueue.async {
             self.cancelTimers()
             self.proxy = proxy
@@ -40,7 +43,9 @@ final class IITDProxySession: ObservableObject {
                 self.activeProxy = proxy
                 self.isActive = true
             }
+            self.publish(status: "Logging in to \(proxy.host)…", healthOK: false, refreshAt: nil)
             self.loginOrAdopt()
+            _ = reason // for future logging
         }
     }
 
@@ -62,19 +67,28 @@ final class IITDProxySession: ObservableObject {
         }
     }
 
-    func forceReconnect() {
+    func forceReconnect(reason: String = "manual") {
         stateQueue.async {
             self.cancelTimers()
             self.usingExistingSession = false
             self.logoutCurrent()
             self.sessionID = ""
             self.consecutiveFailures = 0
+            self.running = true
             self.publish(status: "Reconnecting…", healthOK: false, refreshAt: nil)
-            if self.running {
-                _ = PrivilegedHelper.runHelper(self.proxy.helperAction)
-                self.loginOrAdopt()
+            DispatchQueue.main.async {
+                self.activeProxy = self.proxy
+                self.isActive = true
             }
+            _ = PrivilegedHelper.runHelper(self.proxy.helperAction)
+            self.loginOrAdopt()
+            _ = reason
         }
+    }
+
+    /// UI / watchdog can push a status without touching CGI.
+    func publishExternal(status: String, healthOK: Bool) {
+        publish(status: status, healthOK: healthOK, refreshAt: nil)
     }
 
     /// Prefer clearing system proxy first (caller should do that), then best-effort CGI logout.
@@ -149,7 +163,6 @@ final class IITDProxySession: ObservableObject {
     }
 
     private static func verifyTraffic(on proxy: ProxyChoice) -> Bool {
-        // Explicit -x; still noproxy for other URLs. Short timeouts so we fail fast.
         let code = curl([
             "-k", "-s", "-o", "/dev/null", "-w", "%{http_code}",
             "--connect-timeout", "4", "--max-time", "8",
@@ -200,8 +213,9 @@ final class IITDProxySession: ObservableObject {
         healthTimer = nil
     }
 
-    /// Tear down CGI session and clear macOS proxy so the Mac is not left bricked.
-    private func abandonSession(reason: String) {
+    /// Tear down CGI and clear macOS proxy so the Mac is not left bricked.
+    /// Watchdog will reconnect later if `ProxySelection.desiredOn` is still true.
+    private func abandonSession(reason: String, clearSystemProxy: Bool) {
         cancelTimers()
         running = false
         usingExistingSession = false
@@ -213,10 +227,22 @@ final class IITDProxySession: ObservableObject {
             self.activeProxy = nil
             self.isActive = false
         }
-        // Clear system proxy off this queue so we don't deadlock.
+        guard clearSystemProxy else { return }
         DispatchQueue.global(qos: .userInitiated).async {
-            _ = DNSManager.turnProxyOff()
+            var cleared = DNSManager.turnProxyOff()
+            if !cleared {
+                usleep(400_000)
+                cleared = DNSManager.turnProxyOff()
+            }
             DNSManager.flushDNSOnly()
+            if !cleared || DNSManager.detectActiveProxy() != nil {
+                self.publish(
+                    status: "Proxy still on — clear failed; retrying logout…",
+                    healthOK: false,
+                    refreshAt: nil
+                )
+                _ = DNSManager.turnProxyOff()
+            }
         }
     }
 
@@ -229,32 +255,48 @@ final class IITDProxySession: ObservableObject {
         logoutCurrent()
         sessionID = ""
         usingExistingSession = false
-        // Brief pause so CSC releases the old session.
         Thread.sleep(forTimeInterval: 1.0)
         loginOrAdopt(allowReclaim: false)
     }
 
-    private func noteFailureThen(_ action: () -> Void) {
+    private func noteFailureThen(_ action: @escaping () -> Void) {
         consecutiveFailures += 1
         if consecutiveFailures >= maxConsecutiveFailures {
-            abandonSession(reason: "Proxy unreachable — system proxy cleared so internet works")
+            // Clear so apps don't hang; watchdog re-arms if still desired-on.
+            abandonSession(
+                reason: "Proxy unreachable — cleared; will retry when network is back",
+                clearSystemProxy: true
+            )
             return
         }
         action()
+    }
+
+    private func softRetryDelay() -> TimeInterval {
+        let exp = min(consecutiveFailures, 4)
+        return softRetryBaseSeconds * pow(2.0, Double(max(0, exp - 1)))
     }
 
     private func loginOrAdopt(allowReclaim: Bool = true) {
         guard running else { return }
 
         guard let creds = KeychainStore.load(for: proxy) else {
-            abandonSession(reason: "Missing Kerberos for \(proxy.shortLabel) — save it first")
+            abandonSession(
+                reason: "Missing Kerberos for \(proxy.shortLabel) — save it first",
+                clearSystemProxy: true
+            )
             return
         }
 
         guard let sid = Self.fetchSessionID(on: proxy) else {
             noteFailureThen {
-                self.publish(status: "Cannot reach \(self.proxy.host) — retrying…", healthOK: false, refreshAt: nil)
-                self.scheduleRetry(after: 10)
+                let delay = self.softRetryDelay()
+                self.publish(
+                    status: "Cannot reach \(self.proxy.host) — retry in \(Int(delay))s…",
+                    healthOK: false,
+                    refreshAt: nil
+                )
+                self.scheduleRetry(after: delay)
             }
             return
         }
@@ -271,13 +313,17 @@ final class IITDProxySession: ObservableObject {
             let msg = ok ? "\(proxy.host) logged in" : "\(proxy.host) logged in (checking…)"
             publish(status: msg, healthOK: ok, refreshAt: Date())
             scheduleRefreshTimer()
-            // Confirm traffic shortly after login.
-            scheduleHealthProbe(after: 15)
+            scheduleHealthProbe(after: 12)
             return
         }
 
         if loginText.contains("already logged in") {
             if Self.verifyTraffic(on: proxy) {
+                // Prefer reclaiming so we own Refresh keepalive.
+                if allowReclaim {
+                    reclaimSession()
+                    return
+                }
                 usingExistingSession = true
                 consecutiveFailures = 0
                 publish(status: "\(proxy.host) connected (existing login)", healthOK: true, refreshAt: Date())
@@ -288,20 +334,34 @@ final class IITDProxySession: ObservableObject {
                 reclaimSession()
                 return
             }
-            abandonSession(reason: "Logged in elsewhere — proxy cleared. Log out there, then retry.")
+            // Don't clear forever — leave system proxy; watchdog / user can retry.
+            noteFailureThen {
+                self.publish(
+                    status: "Logged in elsewhere — retrying reclaim…",
+                    healthOK: false,
+                    refreshAt: nil
+                )
+                self.scheduleRetry(after: self.softRetryDelay())
+            }
             return
         }
 
         if loginText.isEmpty {
             noteFailureThen {
-                self.publish(status: "Login timed out — retrying…", healthOK: false, refreshAt: nil)
-                self.scheduleRetry(after: 10)
+                let delay = self.softRetryDelay()
+                self.publish(status: "Login timed out — retry in \(Int(delay))s…", healthOK: false, refreshAt: nil)
+                self.scheduleRetry(after: delay)
             }
             return
         }
 
-        // Bad password shouldn't leave proxy on forever either.
-        abandonSession(reason: "Login failed — check Kerberos password (proxy cleared)")
+        // Bad password — clear immediately so the Mac stays usable.
+        abandonSession(
+            reason: "Login failed — check Kerberos for \(proxy.shortLabel) (proxy cleared)",
+            clearSystemProxy: true
+        )
+        // Don't auto-retry bad password forever.
+        ProxySelection.markDesiredOff()
     }
 
     private func scheduleRetry(after seconds: TimeInterval) {
@@ -323,7 +383,8 @@ final class IITDProxySession: ObservableObject {
     private func scheduleHealthTimerOnly() {
         cancelTimers()
         let timer = DispatchSource.makeTimerSource(queue: stateQueue)
-        timer.schedule(deadline: .now() + 45, repeating: 45)
+        // Tighter than 45s — adopted sessions have no CGI Refresh.
+        timer.schedule(deadline: .now() + 20, repeating: 20)
         timer.setEventHandler { [weak self] in self?.performHealthCheck() }
         timer.resume()
         healthTimer = timer
@@ -364,7 +425,6 @@ final class IITDProxySession: ObservableObject {
             if ok {
                 publish(status: "\(proxy.host) logged in", healthOK: true, refreshAt: Date())
             } else {
-                // CGI says logged in but proxy path is dead — reclaim.
                 noteFailureThen {
                     self.publish(status: "Proxy path dead — re-logging in…", healthOK: false, refreshAt: nil)
                     self.logoutCurrent()
@@ -374,7 +434,6 @@ final class IITDProxySession: ObservableObject {
             return
         }
 
-        // Empty / expired / weird response → re-login. If that fails, abandon clears proxy.
         logoutCurrent()
         publish(status: "Session expired — re-logging in…", healthOK: false, refreshAt: nil)
         loginOrAdopt()
@@ -387,7 +446,6 @@ final class IITDProxySession: ObservableObject {
             publish(status: "\(proxy.host) connected (existing login)", healthOK: true, refreshAt: Date())
             return
         }
-        // Existing foreign session died — reclaim or clear so the Mac is usable.
         noteFailureThen {
             self.publish(status: "Proxy stopped — reclaiming…", healthOK: false, refreshAt: nil)
             self.reclaimSession()

@@ -8,6 +8,7 @@ Compact macOS menu bar app for Wi‑Fi DNS presets and IIT Delhi institute proxy
 - **Institute Proxy:** one-click Proxy 22 or Proxy 62
 - **Kerberos:** separate Keychain entries for Proxy 22 and Proxy 62
 - **Keepalive:** CGI `Refresh` every 60s so the CSC session does not idle out
+- **Auto-reconnect:** watchdog repairs idle+proxy-on, sleep/wake, and Wi‑Fi restores
 - **Launch at Login:** enabled on first run via `SMAppService`
 - **Clear VPN & Reset Network:** turns off leftover proxies / VPN residue
 

@@ -7,7 +7,12 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "DNSToggle",
-            path: "Sources/DNSToggle"
+            path: "Sources/DNSToggle",
+            linkerSettings: [
+                .linkedFramework("Network"),
+                .linkedFramework("ServiceManagement"),
+                .linkedFramework("Security")
+            ]
         )
     ]
 )

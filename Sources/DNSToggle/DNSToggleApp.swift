@@ -66,8 +66,13 @@ struct DNSToggleApp: App {
                     .buttonStyle(.bordered)
                 }
 
-                Button("Save Kerberos…") {
-                    model.promptKerberos()
+                Button("Save Kerberos for Proxy 22…") {
+                    model.promptKerberos(for: .proxy22)
+                }
+                .buttonStyle(.bordered)
+
+                Button("Save Kerberos for Proxy 62…") {
+                    model.promptKerberos(for: .proxy62)
                 }
                 .buttonStyle(.bordered)
 
@@ -127,17 +132,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
 
         DispatchQueue.global(qos: .utility).async {
-            guard KeychainStore.hasCredentials else { return }
-            if let active = DNSManager.detectActiveProxy() {
-                ProxySelection.set(active)
-                IITDProxySession.shared.start(proxy: active)
-            }
+            guard let active = DNSManager.detectActiveProxy(),
+                  KeychainStore.hasCredentials(for: active) else { return }
+            ProxySelection.set(active)
+            IITDProxySession.shared.start(proxy: active)
         }
     }
 
     @objc private func onWake() {
         DispatchQueue.global(qos: .utility).async {
-            guard let active = DNSManager.detectActiveProxy(), KeychainStore.hasCredentials else { return }
+            guard let active = DNSManager.detectActiveProxy(),
+                  KeychainStore.hasCredentials(for: active) else { return }
             let session = IITDProxySession.shared
             if session.isActive {
                 session.forceReconnect()
@@ -279,9 +284,9 @@ final class AppModel: ObservableObject {
 
     func connectProxy(_ choice: ProxyChoice) {
         guard !busy else { return }
-        if !KeychainStore.hasCredentials {
-            promptKerberos()
-            guard KeychainStore.hasCredentials else { return }
+        if !KeychainStore.hasCredentials(for: choice) {
+            promptKerberos(for: choice)
+            guard KeychainStore.hasCredentials(for: choice) else { return }
         }
         busy = true
         ProxySelection.set(choice)
@@ -333,10 +338,10 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func promptKerberos() {
+    func promptKerberos(for proxy: ProxyChoice) {
         let alert = NSAlert()
-        alert.messageText = "IITD Kerberos"
-        alert.informativeText = "Saved only in your Mac Keychain. Used for Proxy 22 and Proxy 62."
+        alert.messageText = "IITD Kerberos — \(proxy.shortLabel)"
+        alert.informativeText = "Saved only in your Mac Keychain for \(proxy.host). Proxy 22 and 62 can have different passwords."
         alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Cancel")
 
@@ -346,8 +351,8 @@ final class AppModel: ObservableObject {
         stack.spacing = 6
 
         let userField = NSTextField(frame: NSRect(x: 0, y: 0, width: width, height: 24))
-        userField.placeholderString = "Kerberos userid"
-        userField.stringValue = KeychainStore.savedUsername
+        userField.placeholderString = "Kerberos userid for \(proxy.rawValue)"
+        userField.stringValue = KeychainStore.savedUsername(for: proxy)
 
         let passField = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: width, height: 24))
         passField.placeholderString = "Kerberos password"
@@ -361,7 +366,7 @@ final class AppModel: ObservableObject {
         let user = userField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         let pass = passField.stringValue
         guard !user.isEmpty, !pass.isEmpty else { return }
-        _ = KeychainStore.save(user: user, password: pass)
+        _ = KeychainStore.save(for: proxy, user: user, password: pass)
         refresh(forceNetwork: true)
     }
 }

@@ -94,10 +94,13 @@ final class IITDProxySession: ObservableObject {
                 _ = Self.cgi(on: snap.0, fields: ["sessionid": snap.1, "action": "logout"])
             }
 
-            if let creds = KeychainStore.load() {
-                for choice in ProxyChoice.allCases {
-                    Self.logoutOnProxy(choice, user: creds.user, pass: creds.pass)
-                }
+            var loggedOutAny = false
+            for choice in ProxyChoice.allCases {
+                guard let creds = KeychainStore.load(for: choice) else { continue }
+                Self.logoutOnProxy(choice, user: creds.user, pass: creds.pass)
+                loggedOutAny = true
+            }
+            if loggedOutAny {
                 self.publish(status: "Logged out on proxy62 + proxy22", healthOK: false, refreshAt: nil)
             } else {
                 self.publish(status: "Proxy cleared", healthOK: false, refreshAt: nil)
@@ -220,7 +223,7 @@ final class IITDProxySession: ObservableObject {
     /// When "already logged in" blocks us, try logout-then-login once.
     private func reclaimSession() {
         publish(status: "Reclaiming session…", healthOK: false, refreshAt: nil)
-        if let creds = KeychainStore.load() {
+        if let creds = KeychainStore.load(for: proxy) {
             Self.logoutOnProxy(proxy, user: creds.user, pass: creds.pass)
         }
         logoutCurrent()
@@ -243,8 +246,8 @@ final class IITDProxySession: ObservableObject {
     private func loginOrAdopt(allowReclaim: Bool = true) {
         guard running else { return }
 
-        guard let creds = KeychainStore.load() else {
-            abandonSession(reason: "Missing Kerberos — Save Kerberos…")
+        guard let creds = KeychainStore.load(for: proxy) else {
+            abandonSession(reason: "Missing Kerberos for \(proxy.shortLabel) — save it first")
             return
         }
 

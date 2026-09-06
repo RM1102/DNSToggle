@@ -1,11 +1,11 @@
 import Foundation
 import Security
 
-/// Kerberos credentials in Apple Keychain.
+/// Per-proxy Kerberos credentials in Apple Keychain.
 /// Service id matches DNS.app so previously saved passwords still work.
 enum KeychainStore {
     static let service = "com.rahulmasand.dns.iitd-proxy"
-    private static let usernameDefaultsKey = "iitdProxyUsername"
+    private static let legacyUsernameKey = "iitdProxyUsername"
 
     private static var cachedPassword: String?
     private static var cachedAccount: String?
@@ -15,51 +15,62 @@ enum KeychainStore {
         cachedAccount = nil
     }
 
-    static var savedUsername: String {
-        UserDefaults.standard.string(forKey: usernameDefaultsKey) ?? ""
+    private static func usernameKey(for proxy: ProxyChoice) -> String {
+        "iitdProxyUsername.\(proxy.rawValue)"
     }
 
-    /// One Kerberos userid + password for whichever proxy is selected.
+    private static func account(for proxy: ProxyChoice, user: String) -> String {
+        "\(proxy.rawValue):\(user)"
+    }
+
+    static func savedUsername(for proxy: ProxyChoice) -> String {
+        if let u = UserDefaults.standard.string(forKey: usernameKey(for: proxy)), !u.isEmpty {
+            return u
+        }
+        // Older single-user builds only stored one username (treated as proxy62).
+        if proxy == .proxy62 {
+            return UserDefaults.standard.string(forKey: legacyUsernameKey) ?? ""
+        }
+        return ""
+    }
+
     @discardableResult
-    static func save(user: String, password: String) -> Bool {
+    static func save(for proxy: ProxyChoice, user: String, password: String) -> Bool {
         let trimmed = user.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !password.isEmpty else { return false }
-        UserDefaults.standard.set(trimmed, forKey: usernameDefaultsKey)
-        // Also mirror per-proxy username keys used by older DNS.app builds.
-        for proxy in ProxyChoice.allCases {
-            UserDefaults.standard.set(trimmed, forKey: "iitdProxyUsername.\(proxy.rawValue)")
+        UserDefaults.standard.set(trimmed, forKey: usernameKey(for: proxy))
+        if proxy == .proxy62 {
+            UserDefaults.standard.set(trimmed, forKey: legacyUsernameKey)
         }
-        let ok = savePassword(password, account: trimmed)
-        // Keep per-proxy Keychain accounts in sync for DNS.app compatibility.
-        for proxy in ProxyChoice.allCases {
-            _ = savePassword(password, account: "\(proxy.rawValue):\(trimmed)")
+        let ok = savePassword(password, account: account(for: proxy, user: trimmed))
+        // Also keep bare-username account for proxy62 legacy DNS.app reads.
+        if proxy == .proxy62 {
+            _ = savePassword(password, account: trimmed)
         }
         return ok
     }
 
-    static func load() -> (user: String, pass: String)? {
-        let user = savedUsername
-        if !user.isEmpty, let pass = loadPassword(account: user) {
+    static func load(for proxy: ProxyChoice) -> (user: String, pass: String)? {
+        let user = savedUsername(for: proxy)
+        guard !user.isEmpty else { return nil }
+        if let pass = loadPassword(account: account(for: proxy, user: user)) {
             return (user, pass)
         }
-        // Fall back to per-proxy accounts from older builds.
-        for proxy in ProxyChoice.allCases {
-            let key = "iitdProxyUsername.\(proxy.rawValue)"
-            let u = UserDefaults.standard.string(forKey: key) ?? ""
-            guard !u.isEmpty else { continue }
-            if let pass = loadPassword(account: "\(proxy.rawValue):\(u)") {
-                UserDefaults.standard.set(u, forKey: usernameDefaultsKey)
-                return (u, pass)
-            }
-            if let pass = loadPassword(account: u) {
-                UserDefaults.standard.set(u, forKey: usernameDefaultsKey)
-                return (u, pass)
-            }
+        // Legacy: bare username Keychain account (pre per-proxy).
+        if proxy == .proxy62, let pass = loadPassword(account: user) {
+            return (user, pass)
         }
         return nil
     }
 
-    static var hasCredentials: Bool { load() != nil }
+    static func hasCredentials(for proxy: ProxyChoice) -> Bool {
+        load(for: proxy) != nil
+    }
+
+    /// True if at least one proxy has saved Kerberos creds.
+    static var hasAnyCredentials: Bool {
+        ProxyChoice.allCases.contains { hasCredentials(for: $0) }
+    }
 
     // MARK: - Keychain primitives
 

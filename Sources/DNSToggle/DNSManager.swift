@@ -116,7 +116,7 @@ enum DNSManager {
         if PrivilegedHelper.runHelper(action) {
             return true
         }
-        // Fallback: admin prompt without helper.
+        // User clicked a DNS preset — one admin prompt is OK if helper missing.
         let svc = escapedShell(networkService())
         let command: String
         if preset.servers.isEmpty {
@@ -130,11 +130,17 @@ enum DNSManager {
         return true
     }
 
+    /// `allowAdminPrompt` false for watchdog/background — never spam password dialogs.
     @discardableResult
-    static func setInstituteProxy(_ choice: ProxyChoice) -> Bool {
+    static func setInstituteProxy(_ choice: ProxyChoice, allowAdminPrompt: Bool = false) -> Bool {
+        // Already pointing at the right host — nothing to change (CGI-only reconnect).
+        if detectActiveProxy() == choice {
+            return true
+        }
         if PrivilegedHelper.runHelper(choice.helperAction) {
             return true
         }
+        guard allowAdminPrompt else { return false }
         let svc = escapedShell(networkService())
         let host = choice.host
         let cmds = [
@@ -149,12 +155,12 @@ enum DNSManager {
     }
 
     @discardableResult
-    static func turnProxyOff() -> Bool {
+    static func turnProxyOff(allowAdminPrompt: Bool = false) -> Bool {
         if PrivilegedHelper.runHelper("proxy-off") {
             return true
         }
+        guard allowAdminPrompt else { return false }
         let svc = escapedShell(networkService())
-        // Fully disable every proxy flavour — leftover PAC/hosts brick the network.
         let cmds = [
             "/usr/sbin/networksetup -setwebproxystate \(svc) off",
             "/usr/sbin/networksetup -setsecurewebproxystate \(svc) off",
@@ -177,9 +183,7 @@ enum DNSManager {
             )
             return
         }
-        _ = PrivilegedHelper.runAdmin(
-            "/usr/bin/dscacheutil -flushcache; /usr/bin/killall -HUP mDNSResponder"
-        )
+        // Never prompt just to flush cache from background.
     }
 
     @discardableResult
@@ -192,6 +196,7 @@ enum DNSManager {
         if PrivilegedHelper.runHelper("clear") {
             ok = true
         } else {
+            // User clicked Clear VPN — admin OK once.
             let svc = escapedShell(networkService())
             let cmds = [
                 "/usr/sbin/networksetup -setdnsservers \(svc) Empty",

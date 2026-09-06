@@ -178,11 +178,26 @@ final class ProxyWatchdog {
 
         let session = IITDProxySession.shared
         if session.isActive, force || !session.lastHealthOK {
-            session.forceReconnect(reason: reason)
+            // CGI-only reconnect when system proxy already correct — no admin needed.
+            session.forceReconnect(reason: reason, reapplySystemProxy: PrivilegedHelper.isPasswordless)
         } else if !session.isActive {
-            // Ensure system proxy points at the right host, then CGI login.
-            _ = DNSManager.setInstituteProxy(choice)
-            session.start(proxy: choice, reason: reason)
+            // Only touch networksetup if helper works OR proxy already points here.
+            if DNSManager.detectActiveProxy() == choice {
+                session.start(proxy: choice, reason: reason)
+            } else if PrivilegedHelper.isPasswordless {
+                _ = DNSManager.setInstituteProxy(choice, allowAdminPrompt: false)
+                session.start(proxy: choice, reason: reason)
+            } else {
+                // Can't set system proxy without prompting — still try CGI in case
+                // proxy is partially configured, and surface a clear status.
+                session.start(proxy: choice, reason: reason)
+                if DNSManager.detectActiveProxy() != choice {
+                    IITDProxySession.shared.publishExternal(
+                        status: "Enable password-free switching (once) for seamless proxy",
+                        healthOK: false
+                    )
+                }
+            }
         }
     }
 }

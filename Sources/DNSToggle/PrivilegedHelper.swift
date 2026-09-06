@@ -4,6 +4,10 @@ import AppKit
 enum PrivilegedHelper {
     static let helperPath = "/Library/PrivilegedHelperTools/com.rahulmasand.dns"
 
+    private static let cacheLock = NSLock()
+    private static var cachedPasswordless: Bool?
+    private static var cachedAt: Date = .distantPast
+
     private static var bundledInstallPaths: [String] {
         var paths: [String] = []
         if let res = Bundle.main.resourcePath {
@@ -41,7 +45,6 @@ enum PrivilegedHelper {
         let waited = group.wait(timeout: .now() + timeoutSeconds)
         if waited == .timedOut {
             p.terminate()
-            // Give it a moment, then force-kill if needed.
             DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.5) {
                 if p.isRunning { kill(p.processIdentifier, SIGKILL) }
             }
@@ -52,6 +55,7 @@ enum PrivilegedHelper {
         return (out, finished && p.terminationStatus == 0)
     }
 
+    /// macOS password dialog — only call from explicit user actions.
     @discardableResult
     static func runAdmin(_ shell: String) -> Bool {
         let esc = shell
@@ -64,26 +68,51 @@ enum PrivilegedHelper {
     }
 
     static var isPasswordless: Bool {
-        FileManager.default.isExecutableFile(atPath: helperPath)
+        cacheLock.lock()
+        if let cached = cachedPasswordless, Date().timeIntervalSince(cachedAt) < 30 {
+            cacheLock.unlock()
+            return cached
+        }
+        cacheLock.unlock()
+
+        let ok = FileManager.default.isExecutableFile(atPath: helperPath)
             && run("/usr/bin/sudo", args: ["-n", helperPath, "ping"], timeoutSeconds: 2).ok
+
+        cacheLock.lock()
+        cachedPasswordless = ok
+        cachedAt = Date()
+        cacheLock.unlock()
+        return ok
     }
 
+    static func invalidatePasswordlessCache() {
+        cacheLock.lock()
+        cachedPasswordless = nil
+        cachedAt = .distantPast
+        cacheLock.unlock()
+    }
+
+    /// Silent helper only — never shows a password dialog.
+    /// Does NOT auto-install (that was causing reconnect password spam).
     @discardableResult
     static func runHelper(_ action: String) -> Bool {
-        if isPasswordless {
-            return run("/usr/bin/sudo", args: ["-n", helperPath, action], timeoutSeconds: 8).ok
+        guard isPasswordless else { return false }
+        let ok = run("/usr/bin/sudo", args: ["-n", helperPath, action], timeoutSeconds: 8).ok
+        if !ok {
+            // Helper may have been removed — don't keep trusting cache forever.
+            invalidatePasswordlessCache()
         }
-        if installPasswordlessHelper() {
-            return run("/usr/bin/sudo", args: ["-n", helperPath, action], timeoutSeconds: 8).ok
-        }
-        return false
+        return ok
     }
 
+    /// One-time install; shows one password prompt. Call only from UI.
     @discardableResult
     static func installPasswordlessHelper() -> Bool {
         guard let install = bundledInstallPaths.first(where: {
             FileManager.default.isReadableFile(atPath: $0)
         }) else { return false }
-        return runAdmin("/bin/bash \(install)")
+        let ok = runAdmin("/bin/bash \(install)")
+        invalidatePasswordlessCache()
+        return ok && isPasswordless
     }
 }

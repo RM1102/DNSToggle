@@ -74,6 +74,13 @@ struct DNSToggleApp: App {
                 }
                 .buttonStyle(.bordered)
 
+                if !model.passwordFreeOn {
+                    Button("Enable password-free switching…") {
+                        model.enablePasswordFree()
+                    }
+                    .buttonStyle(.bordered)
+                }
+
                 Button("Save Kerberos for Proxy 22…") {
                     model.promptKerberos(for: .proxy22)
                 }
@@ -147,6 +154,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var sessionRefreshAt: Date?
     @Published private(set) var sessionActive = false
     @Published private(set) var sessionProxy: ProxyChoice?
+    @Published private(set) var passwordFreeOn = false
 
     private var refreshInFlight = false
     private var pollCount = 0
@@ -212,8 +220,10 @@ final class AppModel: ObservableObject {
         refresh(forceNetwork: true)
         DispatchQueue.global(qos: .utility).async {
             let enabled = LaunchAtLogin.readEnabled()
+            let free = PrivilegedHelper.isPasswordless
             DispatchQueue.main.async { [weak self] in
                 self?.launchAtLogin = enabled
+                self?.passwordFreeOn = free
             }
         }
     }
@@ -223,6 +233,12 @@ final class AppModel: ObservableObject {
         pollCount += 1
         if pollCount % 5 == 0 {
             refresh(forceNetwork: false)
+        }
+        if pollCount % 15 == 0 {
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                let free = PrivilegedHelper.isPasswordless
+                DispatchQueue.main.async { self?.passwordFreeOn = free }
+            }
         }
     }
 
@@ -285,15 +301,19 @@ final class AppModel: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             IITDProxySession.shared.stop(logoutCGI: false)
             usleep(200_000)
-            let ok = DNSManager.setInstituteProxy(choice)
-            if ok {
+            // User click may prompt once if helper missing.
+            let ok = DNSManager.setInstituteProxy(choice, allowAdminPrompt: true)
+            if ok || DNSManager.detectActiveProxy() == choice {
                 IITDProxySession.shared.start(proxy: choice, reason: "user-click")
             } else {
-                // Still try CGI if system somehow already has the host.
-                IITDProxySession.shared.start(proxy: choice, reason: "user-click-helper-fail")
+                IITDProxySession.shared.publishExternal(
+                    status: "Could not set system proxy — enable password-free switching",
+                    healthOK: false
+                )
             }
             DispatchQueue.main.async {
                 self?.busy = false
+                self?.passwordFreeOn = PrivilegedHelper.isPasswordless
                 self?.refresh(forceNetwork: true)
             }
         }
@@ -309,11 +329,28 @@ final class AppModel: ObservableObject {
         busy = true
         ProxySelection.markDesiredOn(choice)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            _ = DNSManager.setInstituteProxy(choice)
+            // Prefer silent path; only prompt if proxy not already set.
+            _ = DNSManager.setInstituteProxy(choice, allowAdminPrompt: DNSManager.detectActiveProxy() != choice)
             ProxyWatchdog.shared.requestReconnect(reason: "user-reconnect", force: true)
             usleep(300_000)
             DispatchQueue.main.async {
                 self?.busy = false
+                self?.refresh(forceNetwork: true)
+            }
+        }
+    }
+
+    func enablePasswordFree() {
+        guard !busy else { return }
+        busy = true
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let ok = PrivilegedHelper.installPasswordlessHelper()
+            DispatchQueue.main.async {
+                self?.busy = false
+                self?.passwordFreeOn = ok
+                if ok {
+                    ProxyWatchdog.shared.requestReconnect(reason: "helper-installed", force: true)
+                }
                 self?.refresh(forceNetwork: true)
             }
         }
@@ -324,7 +361,7 @@ final class AppModel: ObservableObject {
         busy = true
         ProxySelection.markDesiredOff()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            _ = DNSManager.turnProxyOff()
+            _ = DNSManager.turnProxyOff(allowAdminPrompt: true)
             DNSManager.flushDNSOnly()
             DispatchQueue.main.async {
                 self?.refresh(forceNetwork: true)

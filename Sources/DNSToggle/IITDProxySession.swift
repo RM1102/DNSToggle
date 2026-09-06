@@ -67,7 +67,7 @@ final class IITDProxySession: ObservableObject {
         }
     }
 
-    func forceReconnect(reason: String = "manual") {
+    func forceReconnect(reason: String = "manual", reapplySystemProxy: Bool = true) {
         stateQueue.async {
             self.cancelTimers()
             self.usingExistingSession = false
@@ -80,7 +80,10 @@ final class IITDProxySession: ObservableObject {
                 self.activeProxy = self.proxy
                 self.isActive = true
             }
-            _ = PrivilegedHelper.runHelper(self.proxy.helperAction)
+            // Never call admin prompts from here — helper only, or skip.
+            if reapplySystemProxy, PrivilegedHelper.isPasswordless {
+                _ = PrivilegedHelper.runHelper(self.proxy.helperAction)
+            }
             self.loginOrAdopt()
             _ = reason
         }
@@ -229,19 +232,19 @@ final class IITDProxySession: ObservableObject {
         }
         guard clearSystemProxy else { return }
         DispatchQueue.global(qos: .userInitiated).async {
-            var cleared = DNSManager.turnProxyOff()
+            // Silent clear only — never password-prompt from abandon/watchdog.
+            var cleared = DNSManager.turnProxyOff(allowAdminPrompt: false)
             if !cleared {
                 usleep(400_000)
-                cleared = DNSManager.turnProxyOff()
+                cleared = DNSManager.turnProxyOff(allowAdminPrompt: false)
             }
             DNSManager.flushDNSOnly()
             if !cleared || DNSManager.detectActiveProxy() != nil {
                 self.publish(
-                    status: "Proxy still on — clear failed; retrying logout…",
+                    status: "Proxy still on — tap Enable password-free, or Log out",
                     healthOK: false,
                     refreshAt: nil
                 )
-                _ = DNSManager.turnProxyOff()
             }
         }
     }

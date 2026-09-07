@@ -9,8 +9,6 @@ UNBRICK_DEST="/Library/PrivilegedHelperTools/com.rahulmasand.dnstoggle-unbrick"
 SUDOERS="/etc/sudoers.d/dnstoggle"
 PLIST="/Library/LaunchAgents/com.rahulmasand.dnstoggle.unbrick.plist"
 USER_NAME="$(stat -f '%Su' /dev/console)"
-USER_HOME="$(dscl . -read "/Users/$USER_NAME" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
-USER_HOME="${USER_HOME:-/Users/$USER_NAME}"
 USER_UID="$(id -u "$USER_NAME")"
 
 if [ ! -f "$SRC" ]; then
@@ -19,6 +17,12 @@ if [ ! -f "$SRC" ]; then
 fi
 if [ ! -f "$UNBRICK_SRC" ]; then
   echo "missing unbrick script at $UNBRICK_SRC" >&2
+  exit 1
+fi
+
+# Refuse to install from a random writable path (must live under DNSToggle.app Resources).
+if [[ "$(cd "$(dirname "$0")" && pwd)" != /Applications/DNSToggle.app/Contents/Resources ]]; then
+  echo "refusing install outside /Applications/DNSToggle.app/Contents/Resources" >&2
   exit 1
 fi
 
@@ -34,6 +38,7 @@ chmod 755 "$UNBRICK_DEST"
 # Explicit command list — not "any argument to helper".
 TMP="$(mktemp)"
 {
+  printf '%s ALL=(root) NOPASSWD: %s version\n' "$USER_NAME" "$DEST"
   printf '%s ALL=(root) NOPASSWD: %s ping\n' "$USER_NAME" "$DEST"
   printf '%s ALL=(root) NOPASSWD: %s cloudflare\n' "$USER_NAME" "$DEST"
   printf '%s ALL=(root) NOPASSWD: %s google\n' "$USER_NAME" "$DEST"
@@ -60,7 +65,6 @@ mv "$TMP" "$SUDOERS"
 chown root:wheel "$SUDOERS"
 chmod 440 "$SUDOERS"
 
-# LaunchAgent: clear IITD proxy if app gone or heartbeat stale.
 cat > "$PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -86,10 +90,10 @@ PLIST
 chown root:wheel "$PLIST"
 chmod 644 "$PLIST"
 
-# Load for the console user (may fail in some install contexts — app can reload later).
 launchctl bootout "gui/${USER_UID}/com.rahulmasand.dnstoggle.unbrick" 2>/dev/null || true
 launchctl bootstrap "gui/${USER_UID}" "$PLIST" 2>/dev/null || true
 launchctl enable "gui/${USER_UID}/com.rahulmasand.dnstoggle.unbrick" 2>/dev/null || true
 launchctl kickstart -k "gui/${USER_UID}/com.rahulmasand.dnstoggle.unbrick" 2>/dev/null || true
 
-echo "installed helper + unbrick agent for $USER_NAME"
+VER="$("$DEST" version 2>/dev/null || true)"
+echo "installed helper v${VER:-?} + unbrick agent for $USER_NAME"

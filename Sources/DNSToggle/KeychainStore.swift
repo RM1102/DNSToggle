@@ -7,12 +7,8 @@ enum KeychainStore {
     static let service = "com.rahulmasand.dns.iitd-proxy"
     private static let legacyUsernameKey = "iitdProxyUsername"
 
-    private static var cachedPassword: String?
-    private static var cachedAccount: String?
-
     static func clearCache() {
-        cachedPassword = nil
-        cachedAccount = nil
+        // Reserved for future ephemeral buffers; passwords are no longer cached in-process.
     }
 
     private static func usernameKey(for proxy: ProxyChoice) -> String {
@@ -86,16 +82,13 @@ enum KeychainStore {
         var add = query
         add[kSecValueData as String] = data
         add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        let ok = SecItemAdd(add as CFDictionary, nil) == errSecSuccess
-        if ok {
-            cachedPassword = password
-            cachedAccount = account
-        }
-        return ok
+        // Do not keep password in process memory longer than needed.
+        clearCache()
+        return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
     }
 
     private static func loadPassword(account: String) -> String? {
-        if cachedAccount == account, let cachedPassword { return cachedPassword }
+        // No long-lived password cache — reduces dump risk if process is inspected.
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -106,11 +99,6 @@ enum KeychainStore {
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
         guard status == errSecSuccess, let data = item as? Data else { return nil }
-        let pass = String(data: data, encoding: .utf8)
-        if let pass {
-            cachedPassword = pass
-            cachedAccount = account
-        }
-        return pass
+        return String(data: data, encoding: .utf8)
     }
 }

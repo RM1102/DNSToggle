@@ -394,6 +394,8 @@ final class IITDProxySession: ObservableObject {
 
         ProcessRunner.ioQueue.async {
             DNSManager.quitConflictingVPNs()
+            // Public DNS (1.1.1.1 / 8.8.8.8) often cannot reach campus CGI — switch first.
+            self.ensureInstituteDNSBeforeCampus()
             let outcome = self.performLogin(choice)
             self.stateQueue.async {
                 guard gen == self.generation else { return }
@@ -425,6 +427,9 @@ final class IITDProxySession: ObservableObject {
     private func performLogin(_ choice: ProxyChoice) -> LoginOutcome {
         guard let creds = KeychainStore.load(for: choice) else { return .missingCreds }
 
+        // Institute DNS already applied in beginLogin. Do not restore it on transient
+        // unreachable — retries must keep campus resolvers while desiredOn.
+
         if DNSManager.detectActiveProxy() != nil {
             _ = DNSManager.turnProxyOff(allowAdminPrompt: false)
         }
@@ -436,24 +441,20 @@ final class IITDProxySession: ObservableObject {
         ])
 
         if loginText.lowercased().contains("logged in successfully") {
-            rememberDNSAndForceAutomatic()
             let setOK = DNSManager.setInstituteProxy(choice, allowAdminPrompt: false)
             guard setOK else {
                 _ = DNSManager.turnProxyOff(allowAdminPrompt: false)
-                restoreSavedDNSIfNeeded()
                 return .proxySetFailed
             }
             Self.waitForProxyApplied(choice)
             let traffic = Self.verifyTraffic(on: choice)
             if !traffic {
                 _ = DNSManager.turnProxyOff(allowAdminPrompt: false)
-                restoreSavedDNSIfNeeded()
             }
             return .success(sessionID: sid, adopted: false, trafficOK: traffic)
         }
 
         if loginText.contains("already logged in") {
-            rememberDNSAndForceAutomatic()
             let setOK = DNSManager.setInstituteProxy(choice, allowAdminPrompt: false)
             if setOK {
                 Self.waitForProxyApplied(choice)
@@ -464,7 +465,6 @@ final class IITDProxySession: ObservableObject {
             Self.logoutOnProxy(choice, user: creds.user, pass: creds.pass)
             guard let sid2 = Self.fetchSessionID(on: choice) else {
                 _ = DNSManager.turnProxyOff(allowAdminPrompt: false)
-                restoreSavedDNSIfNeeded()
                 return .unreachable
             }
             let again = Self.cgi(on: choice, fields: [
@@ -476,18 +476,15 @@ final class IITDProxySession: ObservableObject {
                 let traffic = setOK2 && Self.verifyTraffic(on: choice)
                 if !traffic {
                     _ = DNSManager.turnProxyOff(allowAdminPrompt: false)
-                    restoreSavedDNSIfNeeded()
                 }
                 return .success(sessionID: sid2, adopted: false, trafficOK: traffic)
             }
             _ = DNSManager.turnProxyOff(allowAdminPrompt: false)
-            restoreSavedDNSIfNeeded()
             return .alreadyElsewhere
         }
 
         if loginText.isEmpty {
             _ = DNSManager.turnProxyOff(allowAdminPrompt: false)
-            restoreSavedDNSIfNeeded()
             return .unreachable
         }
 
@@ -499,7 +496,6 @@ final class IITDProxySession: ObservableObject {
             || lower.contains("authentication failed")
 
         _ = DNSManager.turnProxyOff(allowAdminPrompt: false)
-        restoreSavedDNSIfNeeded()
         return credentialReject ? .badPassword : .unreachable
     }
 
@@ -539,6 +535,7 @@ final class IITDProxySession: ObservableObject {
                 )
                 if externalFailStreak >= Self.externalFailLimit {
                     externalCircuitOpen = true
+                    ProcessRunner.ioQueue.async { self.restoreSavedDNSIfNeeded() }
                     setPhase(
                         .idle,
                         status: "Internet via proxy failed — stopped. Click Reconnect.",
@@ -552,7 +549,6 @@ final class IITDProxySession: ObservableObject {
 
         case .unreachable:
             ProcessRunner.ioQueue.async {
-                self.restoreSavedDNSIfNeeded()
                 _ = DNSManager.turnProxyOff(allowAdminPrompt: false)
             }
             softFailures += 1
@@ -573,6 +569,8 @@ final class IITDProxySession: ObservableObject {
             unreachableStreak += 1
             if unreachableStreak >= Self.circuitBreakerLimit {
                 circuitOpen = true
+                // Giving up for now — restore user's DNS (e.g. Cloudflare) off-campus.
+                ProcessRunner.ioQueue.async { self.restoreSavedDNSIfNeeded() }
                 setPhase(
                     .offCampus,
                     status: "Off campus — proxy left off. Will retry when IIT proxy is reachable.",
@@ -582,6 +580,7 @@ final class IITDProxySession: ObservableObject {
                 return
             }
             let delay = min(60.0, 8.0 * pow(2.0, Double(min(softFailures, 3))))
+            // Keep Institute DNS while retrying so the next attempt can resolve proxyXX.
             setPhase(.idle, status: "Cannot reach \(choice.host) — retry in \(Int(delay))s", health: false, proxy: nil)
             if ProxySelection.desiredOn {
                 scheduleRetry(after: delay, choice: choice)
@@ -596,9 +595,11 @@ final class IITDProxySession: ObservableObject {
 
         case .badPassword:
             ProxySelection.markDesiredOff()
+            ProcessRunner.ioQueue.async { self.restoreSavedDNSIfNeeded() }
             setPhase(.failedAuth, status: "Login failed — check Kerberos for \(choice.shortLabel)", health: false, proxy: nil)
 
         case .missingCreds:
+            ProcessRunner.ioQueue.async { self.restoreSavedDNSIfNeeded() }
             setPhase(.idle, status: "Need Kerberos for \(choice.shortLabel) — save it", health: false, proxy: nil)
 
         case .proxySetFailed:
@@ -679,12 +680,13 @@ final class IITDProxySession: ObservableObject {
                 self.setPhase(.clearing, status: clearingStatus, health: false, proxy: nil)
                 let stopGen = self.generation
                 ProcessRunner.ioQueue.async {
-                    self.restoreSavedDNSIfNeeded()
+                    // Keep Institute DNS for the immediate reconnect; only clear Squid.
                     _ = DNSManager.turnProxyOff(allowAdminPrompt: false)
                     self.stateQueue.async {
                         guard stopGen == self.generation else { return }
                         if self.externalFailStreak >= Self.externalFailLimit, outcome == .externalFailed {
                             self.externalCircuitOpen = true
+                            ProcessRunner.ioQueue.async { self.restoreSavedDNSIfNeeded() }
                             self.setPhase(
                                 .idle,
                                 status: "Internet via proxy failed — stopped. Click Reconnect.",
@@ -723,12 +725,26 @@ final class IITDProxySession: ObservableObject {
 
     // MARK: - DNS while on proxy
 
-    private func rememberDNSAndForceAutomatic() {
+    /// Call before any campus CGI probe / login. Cloudflare/Google DNS often cannot
+    /// resolve or reach proxyXX on IITD Wi‑Fi — Institute/Automatic must come first.
+    func ensureInstituteDNSBeforeCampus() {
         let servers = DNSManager.readDNSServers()
         if !servers.isEmpty {
-            savedDNSPresetID = DNSManager.matchPresetID(servers)
+            let id = DNSManager.matchPresetID(servers)
+            // Only remember a real public preset; don't overwrite with "custom"/empty mid-retry.
+            if id == "cf" || id == "google" || id == "quad9" {
+                savedDNSPresetID = id
+            }
         }
+        if servers.isEmpty {
+            SessionLog.info("DNS already Institute/Automatic")
+            return
+        }
+        SessionLog.info("switching DNS to Institute/Automatic before campus probe")
         _ = PrivilegedHelper.runHelper("auto")
+        DNSManager.flushDNSOnly()
+        // Brief settle so mDNSResponder picks up campus resolvers before CGI curl.
+        Thread.sleep(forTimeInterval: 0.3)
     }
 
     private func restoreSavedDNSIfNeeded() {
@@ -742,6 +758,7 @@ final class IITDProxySession: ObservableObject {
         case "quad9": action = "quad9"
         default: return
         }
+        SessionLog.info("restoring DNS preset \(id)")
         _ = PrivilegedHelper.runHelper(action)
     }
 
@@ -799,7 +816,7 @@ final class IITDProxySession: ObservableObject {
     private static func verifyTraffic(on proxy: ProxyChoice) -> Bool {
         let proxyURL = "http://\(proxy.host):3128"
         let base = [
-            "-k", "-sS", "-o", "/dev/null",
+            "-sS", "-o", "/dev/null",
             "--ipv4", "--http1.1",
             "--connect-timeout", "4", "--max-time", "6",
             "-x", proxyURL
@@ -834,7 +851,7 @@ final class IITDProxySession: ObservableObject {
 
         // Last resort: example.com, but reject IITD login HTML (hthuwal).
         let bodyProbe = [
-            "-k", "-sS",
+            "-sS",
             "--ipv4", "--http1.1",
             "--connect-timeout", "4", "--max-time", "6",
             "-x", proxyURL,

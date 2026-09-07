@@ -1,7 +1,10 @@
 #!/bin/bash
 # Privileged helper for DNSToggle — only known presets, no arbitrary commands.
 # Must run as root via sudo -n. Exactly one argument.
+# Version 2: root check, Wi-Fi/Ethernet-only enable, never abort mid-clear.
 set -u
+
+HELPER_VERSION="2"
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "must run as root" >&2
@@ -9,9 +12,17 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 if [ "$#" -ne 1 ]; then
-  echo "usage: $0 {ping|cloudflare|google|quad9|opendns|adguard|controld|mullvad|auto|clear|flush|proxy-on|proxy62-on|proxy22-on|proxy-off}" >&2
+  echo "usage: $0 {version|ping|cloudflare|google|quad9|opendns|adguard|controld|mullvad|auto|clear|flush|proxy-on|proxy62-on|proxy22-on|proxy-off}" >&2
   exit 1
 fi
+
+# Reject anything that is not a plain token (defense in depth vs sudoers typos).
+case "$1" in
+  *[!a-z0-9-]*)
+    echo "invalid action" >&2
+    exit 1
+    ;;
+esac
 
 PROXY_PORT="3128"
 
@@ -72,7 +83,6 @@ enable_iitd_proxy() {
     /usr/sbin/networksetup -setsecurewebproxystate "$svc" on 2>/dev/null || true
     /usr/sbin/networksetup -setsocksfirewallproxystate "$svc" off 2>/dev/null || true
     /usr/sbin/networksetup -setautoproxystate "$svc" off 2>/dev/null || true
-    # Don't send campus CGI / local through the proxy (avoids chicken-and-egg on keepalive).
     /usr/sbin/networksetup -setproxybypassdomains "$svc" \
       "*.iitd.ac.in" "*.iitd.ernet.in" "localhost" "127.0.0.1" "*.local" 2>/dev/null || true
     any=1
@@ -81,6 +91,10 @@ enable_iitd_proxy() {
 }
 
 case "$1" in
+  version)
+    echo "$HELPER_VERSION"
+    exit 0
+    ;;
   ping)
     echo ok
     exit 0
@@ -128,7 +142,7 @@ case "$1" in
     clear_proxies
     ;;
   *)
-    echo "usage: $0 {ping|cloudflare|google|quad9|opendns|adguard|controld|mullvad|auto|clear|flush|proxy-on|proxy62-on|proxy22-on|proxy-off}" >&2
+    echo "usage: $0 {version|ping|…}" >&2
     exit 1
     ;;
 esac

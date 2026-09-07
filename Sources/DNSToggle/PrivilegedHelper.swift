@@ -3,6 +3,15 @@ import AppKit
 
 enum PrivilegedHelper {
     static let helperPath = "/Library/PrivilegedHelperTools/com.rahulmasand.dns"
+    /// Must match MenuBar/dns-toggle-helper HELPER_VERSION. Old helpers fail this check.
+    static let requiredHelperVersion = "2"
+
+    private static let allowedActions: Set<String> = [
+        "version", "ping",
+        "cloudflare", "google", "quad9", "opendns", "adguard", "controld", "mullvad",
+        "auto", "clear", "flush",
+        "proxy-on", "proxy62-on", "proxy22-on", "proxy-off"
+    ]
 
     private static let cacheLock = NSLock()
     private static var cachedPasswordless: Bool?
@@ -36,24 +45,34 @@ enum PrivilegedHelper {
 
     static var isPasswordless: Bool {
         cacheLock.lock()
-        if let cached = cachedPasswordless, Date().timeIntervalSince(cachedAt) < 120 {
+        if let cached = cachedPasswordless, Date().timeIntervalSince(cachedAt) < 60 {
             cacheLock.unlock()
             return cached
         }
         cacheLock.unlock()
 
         if Thread.isMainThread {
-            return cachedPasswordless ?? FileManager.default.isExecutableFile(atPath: helperPath)
+            return cachedPasswordless ?? false
         }
 
-        let ok = FileManager.default.isExecutableFile(atPath: helperPath)
-            && ProcessRunner.run("/usr/bin/sudo", args: ["-n", helperPath, "ping"], timeoutSeconds: 2).ok
+        let ok = helperIsCurrentVersion()
 
         cacheLock.lock()
         cachedPasswordless = ok
         cachedAt = Date()
         cacheLock.unlock()
         return ok
+    }
+
+    /// True only when sudo -n works AND helper reports the expected version.
+    static func helperIsCurrentVersion() -> Bool {
+        guard FileManager.default.isExecutableFile(atPath: helperPath) else { return false }
+        let ping = ProcessRunner.run("/usr/bin/sudo", args: ["-n", helperPath, "ping"], timeoutSeconds: 2)
+        guard ping.ok else { return false }
+        let ver = ProcessRunner.run("/usr/bin/sudo", args: ["-n", helperPath, "version"], timeoutSeconds: 2)
+        let reported = ver.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Old helpers have no `version` action → empty / usage → force reinstall.
+        return ver.ok && reported == requiredHelperVersion
     }
 
     static func invalidatePasswordlessCache() {
@@ -65,8 +84,11 @@ enum PrivilegedHelper {
 
     @discardableResult
     static func runHelper(_ action: String) -> Bool {
+        guard allowedActions.contains(action) else {
+            SessionLog.warn("blocked unknown helper action")
+            return false
+        }
         guard isPasswordless else { return false }
-        // proxy-on/off walks multiple networksetup services — allow up to 20s.
         let timeout: Double = (action.hasPrefix("proxy") || action == "clear") ? 20 : 8
         let ok = ProcessRunner.run("/usr/bin/sudo", args: ["-n", helperPath, action], timeoutSeconds: timeout).ok
         if !ok { invalidatePasswordlessCache() }
@@ -76,10 +98,20 @@ enum PrivilegedHelper {
     @discardableResult
     static func installPasswordlessHelper() -> Bool {
         guard let install = bundledInstallPaths.first(where: {
-            FileManager.default.isReadableFile(atPath: $0)
+            FileManager.default.isReadableFile(atPath: $0) && isTrustedInstallPath($0)
         }) else { return false }
-        let ok = runAdmin("/bin/bash \(install)")
+        // Single-quote path so spaces / metacharacters cannot break out of the shell string.
+        let quoted = "'" + install.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        let ok = runAdmin("/bin/bash \(quoted)")
         invalidatePasswordlessCache()
-        return ok && isPasswordless
+        return ok && helperIsCurrentVersion()
+    }
+
+    private static func isTrustedInstallPath(_ path: String) -> Bool {
+        let appRoot = "/Applications/DNSToggle.app/"
+        if path.hasPrefix(appRoot) { return true }
+        let bundle = Bundle.main.bundlePath
+        if path.hasPrefix(bundle + "/") { return true }
+        return false
     }
 }

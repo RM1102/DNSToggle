@@ -235,6 +235,8 @@ final class ProxyWatchdog {
         softMiss: Bool = false
     ) {
         ProcessRunner.ioQueue.async {
+            // Reachability uses proxyXX hostname — needs campus DNS, not Cloudflare.
+            IITDProxySession.shared.ensureInstituteDNSBeforeCampus()
             let reachable = IITDProxySession.isCampusReachable(for: choice)
             let leftover = DNSManager.detectActiveProxy() != nil
             self.queue.async {

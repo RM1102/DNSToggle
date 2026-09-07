@@ -334,6 +334,12 @@ enum DNSManager {
     }
 
     private static func escapedShell(_ value: String) -> String {
-        value.replacingOccurrences(of: " ", with: "\\ ")
+        // Only allow characters that appear in real macOS service names.
+        // Reject anything that could break out of AppleScript "do shell script".
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: " -_."))
+        guard value.unicodeScalars.allSatisfy({ allowed.contains($0) }), !value.isEmpty else {
+            return "Wi-Fi"
+        }
+        return value.replacingOccurrences(of: " ", with: "\\ ")
     }
 }

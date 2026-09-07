@@ -96,7 +96,7 @@ struct DNSToggleApp: App {
                         model.enablePasswordFree()
                     }
                     .buttonStyle(.bordered)
-                    Text("Required before Connect — so the app can always turn Squid off without a password.")
+                    Text("Required — your helper may be outdated. Re-enable once so Connect and crash-unbrick work.")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -177,6 +177,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         Heartbeat.stop()
+        KeychainStore.clearCache()
         IITDProxySession.shared.prepareForTermination()
         return .terminateNow
     }

@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Darwin
 
 @main
 struct DNSToggleApp: App {
@@ -15,15 +16,13 @@ struct DNSToggleApp: App {
                         .frame(width: 8, height: 8)
                         .padding(.top, 4)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(model.status.label)
+                        Text(model.headline)
                             .font(.headline)
                             .fixedSize(horizontal: false, vertical: true)
-                        if model.showProxySubtitle {
-                            Text(model.proxyStatusLine)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
+                        Text(model.proxyStatusLine)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
 
@@ -51,15 +50,31 @@ struct DNSToggleApp: App {
                     .foregroundStyle(.secondary)
                     .padding(.top, 2)
 
+                Button {
+                    model.turnProxyOff()
+                } label: {
+                    HStack {
+                        Text("Proxy Off")
+                        Spacer()
+                        if !ProxySelection.desiredOn && !model.sessionActive && !model.status.proxyEnabled {
+                            Image(systemName: "checkmark")
+                        }
+                    }
+                }
+                .buttonStyle(.bordered)
+
                 ForEach(ProxyChoice.allCases) { choice in
                     Button {
-                        model.connectProxy(choice)
+                        model.toggleProxy(choice)
                     } label: {
                         HStack {
                             Text(choice.shortLabel)
                             Spacer()
                             if model.sessionHealthyFor(choice) {
                                 Image(systemName: "checkmark")
+                            } else if ProxySelection.desiredOn && ProxySelection.current == choice {
+                                Image(systemName: "circle")
+                                    .foregroundStyle(.orange)
                             } else if model.systemProxyIs(choice) {
                                 Image(systemName: "exclamationmark.circle")
                                     .foregroundStyle(.orange)
@@ -69,17 +84,28 @@ struct DNSToggleApp: App {
                     .buttonStyle(.bordered)
                 }
 
-                Button("Reconnect proxy now") {
-                    model.reconnectNow()
+                if ProxySelection.desiredOn {
+                    Button("Reconnect proxy now") {
+                        model.reconnectNow()
+                    }
+                    .buttonStyle(.bordered)
                 }
-                .buttonStyle(.bordered)
 
                 if !model.passwordFreeOn {
                     Button("Enable password-free switching…") {
                         model.enablePasswordFree()
                     }
                     .buttonStyle(.bordered)
+                    Text("Required before Connect — so the app can always turn Squid off without a password.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
+
+                Button("Unbrick internet now") {
+                    model.unbrickNow()
+                }
+                .buttonStyle(.bordered)
 
                 Button("Save Kerberos for Proxy 22…") {
                     model.promptKerberos(for: .proxy22)
@@ -88,11 +114,6 @@ struct DNSToggleApp: App {
 
                 Button("Save Kerberos for Proxy 62…") {
                     model.promptKerberos(for: .proxy62)
-                }
-                .buttonStyle(.bordered)
-
-                Button("Log out proxy") {
-                    model.logoutProxy()
                 }
                 .buttonStyle(.bordered)
 
@@ -112,6 +133,13 @@ struct DNSToggleApp: App {
                 .toggleStyle(.checkbox)
                 .font(.caption)
 
+                if ProxySelection.desiredOn && !model.launchAtLogin {
+                    Text("Enable Launch at Login so proxy recovers after restart.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
                 HStack {
                     Button("Refresh Status") { model.refresh(forceNetwork: true) }
                         .buttonStyle(.bordered)
@@ -120,7 +148,7 @@ struct DNSToggleApp: App {
                 }
             }
             .padding(12)
-            .frame(width: 280)
+            .frame(width: 300)
             .onAppear { model.refresh(forceNetwork: true) }
         }
         .menuBarExtraStyle(.window)
@@ -134,11 +162,37 @@ struct DNSToggleApp: App {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var singleInstanceLock: FileHandle?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if !claimSingleInstance() {
+            NSApp.terminate(nil)
+            return
+        }
         NSApp.setActivationPolicy(.accessory)
-        LaunchAtLogin.enableOnFirstLaunchIfNeeded()
-        // Watchdog owns launch resume, wake, Wi‑Fi restore, and idle+proxy-on repair.
+        Heartbeat.start()
         ProxyWatchdog.shared.start()
+        SessionLog.info("app launched")
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        Heartbeat.stop()
+        IITDProxySession.shared.prepareForTermination()
+        return .terminateNow
+    }
+
+    /// Only one globe — two copies fight over system proxy.
+    private func claimSingleInstance() -> Bool {
+        let path = NSTemporaryDirectory() + "com.rahulmasand.dnstoggle.lock"
+        FileManager.default.createFile(atPath: path, contents: nil)
+        guard let handle = FileHandle(forWritingAtPath: path) else { return true }
+        let fd = handle.fileDescriptor
+        if flock(fd, LOCK_EX | LOCK_NB) != 0 {
+            try? handle.close()
+            return false
+        }
+        singleInstanceLock = handle
+        return true
     }
 }
 
@@ -149,20 +203,17 @@ final class AppModel: ObservableObject {
     )
     @Published private(set) var launchAtLogin = false
     @Published private(set) var busy = false
-    @Published private(set) var sessionStatus = "Proxy idle"
+    @Published private(set) var sessionStatus = "Proxy Off"
     @Published private(set) var sessionHealthOK = false
     @Published private(set) var sessionRefreshAt: Date?
     @Published private(set) var sessionActive = false
+    @Published private(set) var sessionBusy = false
     @Published private(set) var sessionProxy: ProxyChoice?
     @Published private(set) var passwordFreeOn = false
+    @Published private(set) var offCampus = false
 
     private var refreshInFlight = false
     private var pollCount = 0
-
-    var showProxySubtitle: Bool {
-        sessionActive || status.proxyEnabled || ProxySelection.desiredOn
-            || sessionStatus.lowercased() != "proxy idle"
-    }
 
     func sessionHealthyFor(_ choice: ProxyChoice) -> Bool {
         sessionActive && sessionProxy == choice && sessionHealthOK
@@ -173,37 +224,80 @@ final class AppModel: ObservableObject {
     }
 
     var proxyHealthy: Bool {
-        sessionHealthOK && (status.proxyEnabled || sessionActive)
+        sessionHealthOK && sessionActive
     }
 
     var isInProgress: Bool {
-        if busy { return true }
+        if busy || sessionBusy { return true }
         let s = sessionStatus.lowercased()
-        return s.contains("reconnect")
-            || s.contains("re-log")
-            || s.contains("logging")
-            || s.contains("expired")
-            || s.contains("checking")
-            || s.contains("retry")
-            || s.contains("reclaim")
-            || s.contains("cannot reach")
+        return s.contains("logging")
+            || s.contains("connecting")
+            || s.contains("reconnecting")
+            || s.contains("waking")
+            || s.contains("clearing")
+            || s.contains("turning proxy")
+            || s.contains("internet via proxy")
     }
 
     var isConnected: Bool {
-        if status.proxyEnabled || sessionActive || ProxySelection.desiredOn {
+        if sessionActive || status.proxyEnabled || ProxySelection.desiredOn {
             return proxyHealthy
         }
         if status.vpnLikelyActive { return false }
         return true
     }
 
-    var proxyStatusLine: String {
-        // Honest: system proxy on but CGI never started.
-        if status.proxyEnabled && !sessionActive {
-            let host = status.activeProxy?.host ?? "proxy"
-            if sessionStatus == "Proxy idle" || sessionStatus.isEmpty {
-                return "\(host) on — session not logged in (auto-fixing…)"
+    var headline: String {
+        let s = sessionStatus.lowercased()
+        if s.contains("asleep") {
+            return "Asleep — proxy cleared"
+        }
+        if s.contains("internet via proxy failed — stopped") {
+            return "Internet via proxy failed — click Reconnect"
+        }
+        if s.contains("internet via proxy") {
+            return "Internet via proxy failed — recovering…"
+        }
+        if s.contains("session expired") && ProxySelection.desiredOn {
+            return "Session expired — reconnecting…"
+        }
+        if sessionBusy || busy {
+            if s.contains("internet via proxy") {
+                return "Internet via proxy failed — recovering…"
             }
+            if s.contains("session expired") {
+                return "Session expired — reconnecting…"
+            }
+            if s.contains("clear") || s.contains("turning") {
+                return "Turning proxy off…"
+            }
+            if s.contains("waking") || s.contains("reconnecting after sleep") {
+                return "Reconnecting after sleep…"
+            }
+            return "Connecting…"
+        }
+        if s.contains("waking") {
+            return "Waking — waiting for campus…"
+        }
+        if proxyHealthy, let p = sessionProxy {
+            return "Connected (\(p.rawValue))"
+        }
+        if offCampus && ProxySelection.desiredOn {
+            return "Off campus"
+        }
+        if status.proxyEnabled && !sessionActive {
+            return "Proxy stuck on — clear it"
+        }
+        if ProxySelection.desiredOn {
+            return "Proxy remembered on"
+        }
+        return "Off · \(status.preset.name)"
+    }
+
+    var proxyStatusLine: String {
+        if status.proxyEnabled && !sessionActive && !sessionBusy {
+            let host = status.activeProxy?.host ?? "proxy"
+            return "\(host) on without a session — use Proxy Off"
         }
         var line = sessionStatus
         if let t = sessionRefreshAt, sessionHealthOK {
@@ -248,7 +342,9 @@ final class AppModel: ObservableObject {
         sessionHealthOK = session.lastHealthOK
         sessionRefreshAt = session.lastRefreshAt
         sessionActive = session.isActive
+        sessionBusy = session.isBusy
         sessionProxy = session.activeProxy
+        offCampus = session.isOffCampus
     }
 
     func setLaunchAtLogin(_ enabled: Bool) {
@@ -268,7 +364,7 @@ final class AppModel: ObservableObject {
         guard !refreshInFlight else { return }
         refreshInFlight = true
         let scanVPN = forceNetwork
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        DispatchQueue.global(qos: .utility).async { [weak self] in
             let next = DNSManager.currentStatus(includeVPNScan: scanVPN)
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -290,54 +386,84 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Clicking the active proxy again turns it off.
+    func toggleProxy(_ choice: ProxyChoice) {
+        if ProxySelection.desiredOn && ProxySelection.current == choice {
+            turnProxyOff()
+            return
+        }
+        connectProxy(choice)
+    }
+
     func connectProxy(_ choice: ProxyChoice) {
-        guard !busy else { return }
+        guard ensureHelperForConnect() else { return }
         if !KeychainStore.hasCredentials(for: choice) {
             promptKerberos(for: choice)
             guard KeychainStore.hasCredentials(for: choice) else { return }
         }
-        busy = true
         ProxySelection.markDesiredOn(choice)
+        IITDProxySession.shared.resetCircuitBreaker()
+        IITDProxySession.shared.requestConnect(choice, reason: "user-click")
+        refresh(forceNetwork: true)
+    }
+
+    func turnProxyOff() {
+        ProxySelection.markDesiredOff()
+        IITDProxySession.shared.requestStop(clearSystemProxy: true, logoutCGI: true, allowAdminPrompt: true)
+        refresh(forceNetwork: true)
+    }
+
+    func reconnectNow() {
+        guard ensureHelperForConnect() else { return }
+        let choice = sessionProxy ?? ProxySelection.current
+        if !KeychainStore.hasCredentials(for: choice) {
+            promptKerberos(for: choice)
+            guard KeychainStore.hasCredentials(for: choice) else { return }
+        }
+        ProxySelection.markDesiredOn(choice)
+        IITDProxySession.shared.resetCircuitBreaker()
+        IITDProxySession.shared.requestConnect(choice, reason: "user-reconnect")
+        refresh(forceNetwork: true)
+    }
+
+    func unbrickNow() {
+        busy = true
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            IITDProxySession.shared.stop(logoutCGI: false)
-            usleep(200_000)
-            // User click may prompt once if helper missing.
-            let ok = DNSManager.setInstituteProxy(choice, allowAdminPrompt: true)
-            if ok || DNSManager.detectActiveProxy() == choice {
-                IITDProxySession.shared.start(proxy: choice, reason: "user-click")
-            } else {
-                IITDProxySession.shared.publishExternal(
-                    status: "Could not set system proxy — enable password-free switching",
-                    healthOK: false
-                )
-            }
+            ProxySelection.markDesiredOff()
+            IITDProxySession.shared.requestStop(clearSystemProxy: true, logoutCGI: false, allowAdminPrompt: true)
+            _ = DNSManager.turnProxyOff(allowAdminPrompt: true)
+            SessionLog.warn("manual unbrick")
             DispatchQueue.main.async {
                 self?.busy = false
-                self?.passwordFreeOn = PrivilegedHelper.isPasswordless
                 self?.refresh(forceNetwork: true)
             }
         }
     }
 
-    func reconnectNow() {
-        guard !busy else { return }
-        let choice = status.activeProxy ?? ProxySelection.current
-        if !KeychainStore.hasCredentials(for: choice) {
-            promptKerberos(for: choice)
-            guard KeychainStore.hasCredentials(for: choice) else { return }
+    /// Connect requires password-free helper so sleep/health can always clear Squid.
+    private func ensureHelperForConnect() -> Bool {
+        if PrivilegedHelper.isPasswordless {
+            passwordFreeOn = true
+            return true
         }
-        busy = true
-        ProxySelection.markDesiredOn(choice)
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            // Prefer silent path; only prompt if proxy not already set.
-            _ = DNSManager.setInstituteProxy(choice, allowAdminPrompt: DNSManager.detectActiveProxy() != choice)
-            ProxyWatchdog.shared.requestReconnect(reason: "user-reconnect", force: true)
-            usleep(300_000)
-            DispatchQueue.main.async {
-                self?.busy = false
-                self?.refresh(forceNetwork: true)
-            }
+        passwordFreeOn = false
+        let alert = NSAlert()
+        alert.messageText = "Enable password-free switching first"
+        alert.informativeText = "Without the helper, DNSToggle cannot clear a dead proxy in the background. That is how the Mac gets stuck. Click Enable, enter your password once, then Connect."
+        alert.addButton(withTitle: "Enable…")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return false }
+        let ok = PrivilegedHelper.installPasswordlessHelper()
+        passwordFreeOn = ok
+        if !ok {
+            let fail = NSAlert()
+            fail.messageText = "Helper install failed"
+            fail.informativeText = "Connect is blocked until password-free switching works."
+            fail.addButton(withTitle: "OK")
+            fail.runModal()
         }
+        return ok
     }
 
     func enablePasswordFree() {
@@ -348,39 +474,18 @@ final class AppModel: ObservableObject {
             DispatchQueue.main.async {
                 self?.busy = false
                 self?.passwordFreeOn = ok
-                if ok {
-                    ProxyWatchdog.shared.requestReconnect(reason: "helper-installed", force: true)
+                if ok, ProxySelection.desiredOn {
+                    ProxyWatchdog.shared.requestReconnect(reason: "helper-installed")
                 }
                 self?.refresh(forceNetwork: true)
-            }
-        }
-    }
-
-    func logoutProxy() {
-        guard !busy else { return }
-        busy = true
-        ProxySelection.markDesiredOff()
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            _ = DNSManager.turnProxyOff(allowAdminPrompt: true)
-            DNSManager.flushDNSOnly()
-            DispatchQueue.main.async {
-                self?.refresh(forceNetwork: true)
-            }
-            IITDProxySession.shared.logoutEverywhere {
-                DNSManager.reloadOpenBrowsers()
-                DispatchQueue.main.async {
-                    self?.busy = false
-                    self?.refresh(forceNetwork: true)
-                }
             }
         }
     }
 
     func clearVPN() {
-        guard !busy else { return }
-        busy = true
         ProxySelection.markDesiredOff()
-        IITDProxySession.shared.stop(logoutCGI: true)
+        IITDProxySession.shared.requestStop(clearSystemProxy: true, logoutCGI: true, allowAdminPrompt: true)
+        busy = true
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             _ = DNSManager.clearVPNEffects(reloadBrowsers: true)
             DispatchQueue.main.async {
@@ -393,7 +498,7 @@ final class AppModel: ObservableObject {
     func promptKerberos(for proxy: ProxyChoice) {
         let alert = NSAlert()
         alert.messageText = "IITD Kerberos — \(proxy.shortLabel)"
-        alert.informativeText = "Saved only in your Mac Keychain for \(proxy.host). Proxy 22 and 62 can have different passwords."
+        alert.informativeText = "Saved only in your Mac Keychain for \(proxy.host). Proxy 22 and 62 can have different passwords. Saving does not turn the proxy on."
         alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Cancel")
 
@@ -419,11 +524,11 @@ final class AppModel: ObservableObject {
         let pass = passField.stringValue
         guard !user.isEmpty, !pass.isEmpty else { return }
         _ = KeychainStore.save(for: proxy, user: user, password: pass)
-        // If this proxy is desired/on, reconnect immediately now that creds exist.
-        if ProxySelection.desiredOn || DNSManager.detectActiveProxy() == proxy
-            || ProxySelection.current == proxy {
-            ProxySelection.markDesiredOn(proxy)
-            ProxyWatchdog.shared.requestReconnect(reason: "creds-saved", force: true)
+        // Never force-connect on save — only reconnect if user already wanted proxy on.
+        if ProxySelection.desiredOn {
+            ProxySelection.set(proxy)
+            IITDProxySession.shared.resetCircuitBreaker()
+            IITDProxySession.shared.requestConnect(proxy, reason: "creds-saved")
         }
         refresh(forceNetwork: true)
     }

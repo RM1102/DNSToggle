@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 APP="/Applications/DNSToggle.app"
 BIN="$APP/Contents/MacOS/DNSToggle"
 HELPER_SRC="$ROOT/MenuBar/dns-toggle-helper"
+UNBRICK_SRC="$ROOT/MenuBar/dnstoggle-unbrick.sh"
 INSTALL_SRC="$ROOT/MenuBar/install-helper.sh"
 
 echo "Building DNSToggle..."
@@ -16,7 +17,6 @@ pkill -9 -f "/Applications/DNS.app/Contents/MacOS/DNS" 2>/dev/null || true
 pkill -9 -x DNS 2>/dev/null || true
 pkill -9 -f "/Applications/DNSToggle.app/Contents/MacOS/DNSToggle" 2>/dev/null || true
 pkill -9 -x DNSToggle 2>/dev/null || true
-pkill -f "dns_toggle.py" 2>/dev/null || true
 
 # Keep Spotlight clean — only one app.
 LS=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
@@ -28,43 +28,11 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 cp ".build/release/DNSToggle" "$BIN"
 cp "$HELPER_SRC" "$APP/Contents/Resources/dns-toggle-helper"
-# Rewrite install script paths relative to Resources.
-cat > "$APP/Contents/Resources/install-helper.sh" <<'HELPER'
-#!/bin/bash
-# Run as root. Installs the DNS helper and a NOPASSWD sudoers rule for the console user.
-set -euo pipefail
-
-SRC="$(cd "$(dirname "$0")" && pwd)/dns-toggle-helper"
-DEST="/Library/PrivilegedHelperTools/com.rahulmasand.dns"
-SUDOERS="/etc/sudoers.d/dnstoggle"
-USER_NAME="$(stat -f '%Su' /dev/console)"
-
-if [ ! -f "$SRC" ]; then
-  echo "missing helper at $SRC" >&2
-  exit 1
-fi
-
-mkdir -p /Library/PrivilegedHelperTools
-cp "$SRC" "$DEST"
-chown root:wheel "$DEST"
-chmod 755 "$DEST"
-
-TMP="$(mktemp)"
-printf '%s ALL=(root) NOPASSWD: %s\n' "$USER_NAME" "$DEST" > "$TMP"
-chmod 440 "$TMP"
-if ! /usr/sbin/visudo -cf "$TMP"; then
-  rm -f "$TMP"
-  echo "sudoers validation failed" >&2
-  exit 1
-fi
-mv "$TMP" "$SUDOERS"
-chown root:wheel "$SUDOERS"
-chmod 440 "$SUDOERS"
-
-echo "installed helper for $USER_NAME"
-HELPER
+cp "$UNBRICK_SRC" "$APP/Contents/Resources/dnstoggle-unbrick.sh"
+cp "$INSTALL_SRC" "$APP/Contents/Resources/install-helper.sh"
 chmod +x "$BIN" \
          "$APP/Contents/Resources/dns-toggle-helper" \
+         "$APP/Contents/Resources/dnstoggle-unbrick.sh" \
          "$APP/Contents/Resources/install-helper.sh"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
@@ -87,9 +55,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>2.1</string>
+    <string>2.5</string>
     <key>CFBundleVersion</key>
-    <string>3</string>
+    <string>7</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>LSUIElement</key>
@@ -113,4 +81,5 @@ fi
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP"
 open "$APP"
 
-echo "Installed and launched /Applications/DNSToggle.app — look for the globe in the menu bar."
+echo "Installed and launched /Applications/DNSToggle.app (v2.5) — look for the globe in the menu bar."
+echo "If Connect is blocked: click Enable password-free switching… once."

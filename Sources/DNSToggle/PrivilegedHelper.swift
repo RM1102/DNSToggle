@@ -17,45 +17,12 @@ enum PrivilegedHelper {
         return paths
     }
 
-    /// Runs a process with a hard timeout so the UI never waits forever.
+    @discardableResult
     static func run(_ cmd: String, args: [String], timeoutSeconds: Double = 4) -> (output: String, ok: Bool) {
-        let p = Process()
-        let pipe = Pipe()
-        p.executableURL = URL(fileURLWithPath: cmd)
-        p.arguments = args
-        p.standardOutput = pipe
-        p.standardError = pipe
-
-        let group = DispatchGroup()
-        group.enter()
-        var finished = false
-
-        do {
-            try p.run()
-        } catch {
-            return ("", false)
-        }
-
-        DispatchQueue.global(qos: .utility).async {
-            p.waitUntilExit()
-            finished = true
-            group.leave()
-        }
-
-        let waited = group.wait(timeout: .now() + timeoutSeconds)
-        if waited == .timedOut {
-            p.terminate()
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.5) {
-                if p.isRunning { kill(p.processIdentifier, SIGKILL) }
-            }
-            return ("", false)
-        }
-
-        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        return (out, finished && p.terminationStatus == 0)
+        ProcessRunner.run(cmd, args: args, timeoutSeconds: timeoutSeconds)
     }
 
-    /// macOS password dialog — only call from explicit user actions.
+    /// macOS password dialog — only from an explicit user click, never from watchdog.
     @discardableResult
     static func runAdmin(_ shell: String) -> Bool {
         let esc = shell
@@ -69,14 +36,18 @@ enum PrivilegedHelper {
 
     static var isPasswordless: Bool {
         cacheLock.lock()
-        if let cached = cachedPasswordless, Date().timeIntervalSince(cachedAt) < 30 {
+        if let cached = cachedPasswordless, Date().timeIntervalSince(cachedAt) < 120 {
             cacheLock.unlock()
             return cached
         }
         cacheLock.unlock()
 
+        if Thread.isMainThread {
+            return cachedPasswordless ?? FileManager.default.isExecutableFile(atPath: helperPath)
+        }
+
         let ok = FileManager.default.isExecutableFile(atPath: helperPath)
-            && run("/usr/bin/sudo", args: ["-n", helperPath, "ping"], timeoutSeconds: 2).ok
+            && ProcessRunner.run("/usr/bin/sudo", args: ["-n", helperPath, "ping"], timeoutSeconds: 2).ok
 
         cacheLock.lock()
         cachedPasswordless = ok
@@ -92,20 +63,16 @@ enum PrivilegedHelper {
         cacheLock.unlock()
     }
 
-    /// Silent helper only — never shows a password dialog.
-    /// Does NOT auto-install (that was causing reconnect password spam).
     @discardableResult
     static func runHelper(_ action: String) -> Bool {
         guard isPasswordless else { return false }
-        let ok = run("/usr/bin/sudo", args: ["-n", helperPath, action], timeoutSeconds: 8).ok
-        if !ok {
-            // Helper may have been removed — don't keep trusting cache forever.
-            invalidatePasswordlessCache()
-        }
+        // proxy-on/off walks multiple networksetup services — allow up to 20s.
+        let timeout: Double = (action.hasPrefix("proxy") || action == "clear") ? 20 : 8
+        let ok = ProcessRunner.run("/usr/bin/sudo", args: ["-n", helperPath, action], timeoutSeconds: timeout).ok
+        if !ok { invalidatePasswordlessCache() }
         return ok
     }
 
-    /// One-time install; shows one password prompt. Call only from UI.
     @discardableResult
     static func installPasswordlessHelper() -> Bool {
         guard let install = bundledInstallPaths.first(where: {

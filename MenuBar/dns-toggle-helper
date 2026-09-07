@@ -1,63 +1,84 @@
 #!/bin/bash
 # Privileged helper for DNSToggle — only known presets, no arbitrary commands.
-set -euo pipefail
+# Must run as root via sudo -n. Exactly one argument.
+set -u
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "must run as root" >&2
+  exit 1
+fi
+
+if [ "$#" -ne 1 ]; then
+  echo "usage: $0 {ping|cloudflare|google|quad9|opendns|adguard|controld|mullvad|auto|clear|flush|proxy-on|proxy62-on|proxy22-on|proxy-off}" >&2
+  exit 1
+fi
 
 PROXY_PORT="3128"
 
-usage() {
-  echo "usage: $0 {ping|cloudflare|google|quad9|opendns|adguard|controld|mullvad|auto|clear|flush|proxy-on|proxy62-on|proxy22-on|proxy-off}" >&2
-  exit 1
-}
-
 flush_dns() {
-  /usr/bin/dscacheutil -flushcache
+  /usr/bin/dscacheutil -flushcache 2>/dev/null || true
   /usr/bin/killall -HUP mDNSResponder 2>/dev/null || true
 }
 
 active_services() {
-  /usr/sbin/networksetup -listallnetworkservices | awk 'NR>1 && $0 !~ /^\*/'
+  /usr/sbin/networksetup -listallnetworkservices 2>/dev/null | awk 'NR>1 && $0 !~ /^\*/'
+}
+
+# Enable only primary links — never iPhone USB / Thunderbolt Bridge (tethering brick).
+enable_services() {
+  while IFS= read -r svc; do
+    [ -z "$svc" ] && continue
+    local lower
+    lower="$(printf '%s' "$svc" | tr '[:upper:]' '[:lower:]')"
+    case "$lower" in
+      *wi-fi*|*wifi*|*airport*|*ethernet*)
+        printf '%s\n' "$svc"
+        ;;
+    esac
+  done < <(active_services)
 }
 
 apply_dns() {
   while IFS= read -r svc; do
     [ -z "$svc" ] && continue
-    /usr/sbin/networksetup -setdnsservers "$svc" "$@"
+    /usr/sbin/networksetup -setdnsservers "$svc" "$@" 2>/dev/null || true
   done < <(active_services)
 }
 
+# Never abort mid-loop — leftover proxy on one service is worse than a noisy error.
 clear_proxies() {
   while IFS= read -r svc; do
     [ -z "$svc" ] && continue
-    /usr/sbin/networksetup -setwebproxystate "$svc" off
-    /usr/sbin/networksetup -setsecurewebproxystate "$svc" off
-    /usr/sbin/networksetup -setsocksfirewallproxystate "$svc" off
-    /usr/sbin/networksetup -setautoproxystate "$svc" off
+    /usr/sbin/networksetup -setwebproxystate "$svc" off 2>/dev/null || true
+    /usr/sbin/networksetup -setsecurewebproxystate "$svc" off 2>/dev/null || true
+    /usr/sbin/networksetup -setsocksfirewallproxystate "$svc" off 2>/dev/null || true
+    /usr/sbin/networksetup -setautoproxystate "$svc" off 2>/dev/null || true
     /usr/sbin/networksetup -setproxybypassdomains "$svc" Empty 2>/dev/null || true
-    # Wipe leftover host/port so nothing still points at a dead proxyXX.
     /usr/sbin/networksetup -setwebproxy "$svc" "" "" off 2>/dev/null || true
     /usr/sbin/networksetup -setsecurewebproxy "$svc" "" "" off 2>/dev/null || true
-    /usr/sbin/networksetup -setwebproxystate "$svc" off
-    /usr/sbin/networksetup -setsecurewebproxystate "$svc" off
+    /usr/sbin/networksetup -setwebproxystate "$svc" off 2>/dev/null || true
+    /usr/sbin/networksetup -setsecurewebproxystate "$svc" off 2>/dev/null || true
   done < <(active_services)
 }
 
 enable_iitd_proxy() {
   local host="$1"
+  local any=0
   while IFS= read -r svc; do
     [ -z "$svc" ] && continue
-    /usr/sbin/networksetup -setwebproxy "$svc" "$host" "$PROXY_PORT" off
-    /usr/sbin/networksetup -setsecurewebproxy "$svc" "$host" "$PROXY_PORT" off
-    /usr/sbin/networksetup -setwebproxystate "$svc" on
-    /usr/sbin/networksetup -setsecurewebproxystate "$svc" on
-    /usr/sbin/networksetup -setsocksfirewallproxystate "$svc" off
-    /usr/sbin/networksetup -setautoproxystate "$svc" off
+    /usr/sbin/networksetup -setwebproxy "$svc" "$host" "$PROXY_PORT" off 2>/dev/null || continue
+    /usr/sbin/networksetup -setsecurewebproxy "$svc" "$host" "$PROXY_PORT" off 2>/dev/null || true
+    /usr/sbin/networksetup -setwebproxystate "$svc" on 2>/dev/null || true
+    /usr/sbin/networksetup -setsecurewebproxystate "$svc" on 2>/dev/null || true
+    /usr/sbin/networksetup -setsocksfirewallproxystate "$svc" off 2>/dev/null || true
+    /usr/sbin/networksetup -setautoproxystate "$svc" off 2>/dev/null || true
     # Don't send campus CGI / local through the proxy (avoids chicken-and-egg on keepalive).
     /usr/sbin/networksetup -setproxybypassdomains "$svc" \
       "*.iitd.ac.in" "*.iitd.ernet.in" "localhost" "127.0.0.1" "*.local" 2>/dev/null || true
-  done < <(active_services)
+    any=1
+  done < <(enable_services)
+  [ "$any" -eq 1 ]
 }
-
-[ $# -ge 1 ] || usage
 
 case "$1" in
   ping)
@@ -98,16 +119,17 @@ case "$1" in
     clear_proxies
     ;;
   proxy-on|proxy62-on)
-    enable_iitd_proxy "proxy62.iitd.ac.in"
+    enable_iitd_proxy "proxy62.iitd.ac.in" || exit 1
     ;;
   proxy22-on)
-    enable_iitd_proxy "proxy22.iitd.ac.in"
+    enable_iitd_proxy "proxy22.iitd.ac.in" || exit 1
     ;;
   proxy-off)
     clear_proxies
     ;;
   *)
-    usage
+    echo "usage: $0 {ping|cloudflare|google|quad9|opendns|adguard|controld|mullvad|auto|clear|flush|proxy-on|proxy62-on|proxy22-on|proxy-off}" >&2
+    exit 1
     ;;
 esac
 

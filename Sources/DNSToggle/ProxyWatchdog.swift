@@ -2,22 +2,21 @@ import Foundation
 import Network
 import AppKit
 
-/// Keeps institute proxy CGI logged in whenever the user wants it on.
-/// Fixes: relaunch idle+checkmark, sleep/wake, Wi‑Fi blips, Keychain unlock delay.
+/// Scheduler only. Never runs curl or waits on CGI.
+/// Sleep clears proxy; wake forces staggered campus-gated re-auth.
 final class ProxyWatchdog {
     static let shared = ProxyWatchdog()
 
     private let queue = DispatchQueue(label: "com.rahulmasand.dnstoggle.watchdog")
     private var pathMonitor: NWPathMonitor?
-    private var reconcileTimer: DispatchSourceTimer?
-    private var keychainRetryTimer: DispatchSourceTimer?
-    private var lastPathSatisfied = true
-    private var lastReconnectAt: Date = .distantPast
-    private var wakeWorkItem: DispatchWorkItem?
+    private var timer: DispatchSourceTimer?
     private var started = false
+    private var pathOK = true
+    private var wakeWorks: [DispatchWorkItem] = []
+    private var pathRestoreWork: DispatchWorkItem?
 
-    private let minReconnectGap: TimeInterval = 8
-    private let reconcileInterval: TimeInterval = 15
+    /// Staggered wake attempts (seconds after didWake). Wi‑Fi often needs >5s.
+    private static let wakeDelays: [TimeInterval] = [8, 20, 45]
 
     private init() {}
 
@@ -26,12 +25,19 @@ final class ProxyWatchdog {
             guard !self.started else { return }
             self.started = true
             self.startPathMonitor()
-            self.startReconcileTimer()
-            self.bootstrapFromSystemOrDesired()
-            self.startKeychainRetryWindow()
+            self.startTimer()
+            self.recoverAtLaunch()
         }
 
-        NSWorkspace.shared.notificationCenter.addObserver(
+        let nc = NSWorkspace.shared.notificationCenter
+        nc.addObserver(
+            forName: NSWorkspace.willSleepNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            self?.handleWillSleep()
+        }
+        nc.addObserver(
             forName: NSWorkspace.didWakeNotification,
             object: nil,
             queue: nil
@@ -40,65 +46,123 @@ final class ProxyWatchdog {
         }
     }
 
-    // MARK: - Public triggers
-
-    func requestReconnect(reason: String, force: Bool = false) {
+    func requestReconnect(reason: String) {
         queue.async {
-            self.reconnectIfNeeded(reason: reason, force: force)
+            guard ProxySelection.desiredOn else { return }
+            let choice = ProxySelection.current
+            guard KeychainStore.hasCredentials(for: choice) else {
+                IITDProxySession.shared.publishExternal(
+                    status: "Need Kerberos for \(choice.shortLabel) — save it",
+                    healthOK: false
+                )
+                return
+            }
+            self.connectIfCampusReachable(choice, reason: reason)
+        }
+    }
+
+    // MARK: - Sleep / wake
+
+    private func handleWillSleep() {
+        queue.async {
+            self.cancelWakeWorks()
+            self.pathRestoreWork?.cancel()
+            // Keep desiredOn. Clear Squid so overnight sleep cannot brick the Mac.
+            IITDProxySession.shared.markStaleForSleep()
         }
     }
 
     func handleWake() {
         queue.async {
-            self.wakeWorkItem?.cancel()
-            let work = DispatchWorkItem { [weak self] in
-                self?.reconnectIfNeeded(reason: "wake", force: true)
+            self.cancelWakeWorks()
+            DNSManager.invalidateProxyCache()
+            PrivilegedHelper.invalidatePasswordlessCache()
+            IITDProxySession.shared.resetCircuitBreaker()
+
+            guard ProxySelection.desiredOn else { return }
+
+            IITDProxySession.shared.publishExternal(
+                status: "Waking — waiting for campus network…",
+                healthOK: false
+            )
+
+            for delay in Self.wakeDelays {
+                let label = "wake-\(Int(delay))"
+                let work = DispatchWorkItem { [weak self] in
+                    self?.wakeAttempt(reason: label)
+                }
+                self.wakeWorks.append(work)
+                self.queue.asyncAfter(deadline: .now() + delay, execute: work)
             }
-            self.wakeWorkItem = work
-            // Wi‑Fi + Keychain need a beat after sleep.
-            self.queue.asyncAfter(deadline: .now() + 5, execute: work)
         }
     }
 
-    // MARK: - Bootstrap
-
-    private func bootstrapFromSystemOrDesired() {
-        // If macOS still has proxy22/62 on from a previous session, treat as desired-on.
-        if let active = DNSManager.detectActiveProxy() {
-            ProxySelection.markDesiredOn(active)
-            reconnectIfNeeded(reason: "launch-system-proxy", force: true)
+    private func wakeAttempt(reason: String) {
+        guard ProxySelection.desiredOn else { return }
+        // Wait until path looks up; staggered schedule will try again.
+        guard pathOK else {
+            IITDProxySession.shared.publishExternal(
+                status: "Waking — waiting for campus network…",
+                healthOK: false
+            )
             return
         }
-        if ProxySelection.desiredOn {
-            reconnectIfNeeded(reason: "launch-desired", force: true)
-        }
-    }
 
-    private func startKeychainRetryWindow() {
-        keychainRetryTimer?.cancel()
-        let timer = DispatchSource.makeTimerSource(queue: queue)
-        // Retry for ~90s after launch in case Keychain is still locked.
-        timer.schedule(deadline: .now() + 5, repeating: 5)
-        var ticks = 0
-        timer.setEventHandler { [weak self] in
-            guard let self else { return }
-            ticks += 1
-            if ticks > 18 {
-                self.keychainRetryTimer?.cancel()
-                self.keychainRetryTimer = nil
+        let session = IITDProxySession.shared
+        if session.isLoggedIn {
+            cancelWakeWorks()
+            return
+        }
+        if session.isBusy && session.currentPhase == .loggingIn {
+            return
+        }
+        if session.currentPhase == .failedAuth { return }
+
+        let choice = ProxySelection.current
+        guard KeychainStore.hasCredentials(for: choice) else { return }
+
+        // Settle briefly after path.satisfied before CGI probe.
+        let settle = DispatchWorkItem { [weak self] in
+            guard let self, self.pathOK, ProxySelection.desiredOn else { return }
+            if IITDProxySession.shared.isLoggedIn {
+                self.cancelWakeWorks()
                 return
             }
-            guard ProxySelection.desiredOn || DNSManager.detectActiveProxy() != nil else { return }
-            let choice = DNSManager.detectActiveProxy() ?? ProxySelection.current
-            guard KeychainStore.hasCredentials(for: choice) else { return }
-            if !IITDProxySession.shared.isActive {
-                self.reconnectIfNeeded(reason: "keychain-ready", force: true)
-                self.keychainRetryTimer?.cancel()
-                self.keychainRetryTimer = nil
+            self.connectIfCampusReachable(choice, reason: reason, softMiss: true)
+        }
+        queue.asyncAfter(deadline: .now() + 2, execute: settle)
+    }
+
+    private func cancelWakeWorks() {
+        wakeWorks.forEach { $0.cancel() }
+        wakeWorks.removeAll()
+    }
+
+    // MARK: - Launch
+
+    private func recoverAtLaunch() {
+        ProcessRunner.ioQueue.async {
+            let leftover = DNSManager.detectActiveProxy()
+            self.queue.async {
+                if let leftover {
+                    if ProxySelection.desiredOn, KeychainStore.hasCredentials(for: leftover) {
+                        ProxySelection.set(leftover)
+                        self.connectIfCampusReachable(leftover, reason: "launch-leftover", softMiss: true)
+                        return
+                    }
+                    ProcessRunner.ioQueue.async {
+                        _ = DNSManager.turnProxyOff(allowAdminPrompt: false)
+                    }
+                    IITDProxySession.shared.publishExternal(
+                        status: "Cleared leftover proxy from last session",
+                        healthOK: false
+                    )
+                }
+                if ProxySelection.desiredOn, KeychainStore.hasCredentials(for: ProxySelection.current) {
+                    self.connectIfCampusReachable(ProxySelection.current, reason: "launch-desired", softMiss: true)
+                }
             }
         }
-        timer.resume()
-        keychainRetryTimer = timer
     }
 
     // MARK: - Path + timer
@@ -110,92 +174,96 @@ final class ProxyWatchdog {
             guard let self else { return }
             self.queue.async {
                 let ok = path.status == .satisfied
-                let was = self.lastPathSatisfied
-                self.lastPathSatisfied = ok
+                let was = self.pathOK
+                self.pathOK = ok
+                if !ok && was {
+                    self.pathRestoreWork?.cancel()
+                    IITDProxySession.shared.handlePathDown()
+                }
                 if ok && !was {
-                    // Network came back — debounce then reconnect.
-                    self.queue.asyncAfter(deadline: .now() + 3) {
-                        self.reconnectIfNeeded(reason: "path-restored", force: true)
+                    IITDProxySession.shared.resetCircuitBreaker()
+                    DNSManager.invalidateProxyCache()
+                    self.pathRestoreWork?.cancel()
+                    let work = DispatchWorkItem { [weak self] in
+                        self?.tick(reason: "path-restored")
                     }
+                    self.pathRestoreWork = work
+                    // 2s settle after unsatisfied→satisfied, then tick.
+                    self.queue.asyncAfter(deadline: .now() + 2, execute: work)
                 }
             }
         }
         monitor.start(queue: queue)
     }
 
-    private func startReconcileTimer() {
+    private func startTimer() {
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + reconcileInterval, repeating: reconcileInterval)
-        timer.setEventHandler { [weak self] in
-            self?.reconcile()
-        }
+        timer.schedule(deadline: .now() + 15, repeating: 15)
+        timer.setEventHandler { [weak self] in self?.tick(reason: "watchdog") }
         timer.resume()
-        reconcileTimer = timer
+        self.timer = timer
     }
 
-    /// Periodic: system proxy on or desired-on, but CGI not running → start again.
-    private func reconcile() {
-        let system = DNSManager.detectActiveProxy()
-        if let system {
-            // Stay in sync with what macOS has.
-            if !ProxySelection.desiredOn {
-                ProxySelection.markDesiredOn(system)
-            } else if ProxySelection.current != system {
-                ProxySelection.set(system)
-            }
-        }
+    private func tick(reason: String) {
+        // Always reconcile leftover IITD proxy vs session state (even when desiredOff).
+        IITDProxySession.shared.reconcileSystemProxy()
 
-        guard ProxySelection.desiredOn || system != nil else { return }
+        guard pathOK else { return }
+        guard ProxySelection.desiredOn else { return }
 
         let session = IITDProxySession.shared
-        if !session.isActive {
-            reconnectIfNeeded(reason: "watchdog-idle", force: false)
-            return
-        }
-        if !session.lastHealthOK {
-            // Soft nudge — session thinks it's on but traffic is bad.
-            reconnectIfNeeded(reason: "watchdog-unhealthy", force: false)
+        if session.isBusy { return }
+        if session.currentPhase == .failedAuth { return }
+
+        let isWake = reason.hasPrefix("wake")
+        // Normal watchdog: skip connect if already healthy (health probe owns mid-session checks).
+        if !isWake, session.isLoggedIn { return }
+
+        let choice = ProxySelection.current
+        guard KeychainStore.hasCredentials(for: choice) else { return }
+
+        if isWake {
+            connectIfCampusReachable(choice, reason: reason, softMiss: true)
+        } else {
+            connectIfCampusReachable(choice, reason: reason, softMiss: reason == "path-restored")
         }
     }
 
-    private func reconnectIfNeeded(reason: String, force: Bool) {
-        guard ProxySelection.desiredOn || DNSManager.detectActiveProxy() != nil else { return }
-
-        let now = Date()
-        if !force, now.timeIntervalSince(lastReconnectAt) < minReconnectGap { return }
-        lastReconnectAt = now
-
-        let choice = DNSManager.detectActiveProxy() ?? ProxySelection.current
-        ProxySelection.set(choice)
-
-        guard KeychainStore.hasCredentials(for: choice) else {
-            IITDProxySession.shared.publishExternal(
-                status: "Need Kerberos for \(choice.shortLabel) — save it",
-                healthOK: false
-            )
-            return
-        }
-
-        let session = IITDProxySession.shared
-        if session.isActive, force || !session.lastHealthOK {
-            // CGI-only reconnect when system proxy already correct — no admin needed.
-            session.forceReconnect(reason: reason, reapplySystemProxy: PrivilegedHelper.isPasswordless)
-        } else if !session.isActive {
-            // Only touch networksetup if helper works OR proxy already points here.
-            if DNSManager.detectActiveProxy() == choice {
-                session.start(proxy: choice, reason: reason)
-            } else if PrivilegedHelper.isPasswordless {
-                _ = DNSManager.setInstituteProxy(choice, allowAdminPrompt: false)
-                session.start(proxy: choice, reason: reason)
-            } else {
-                // Can't set system proxy without prompting — still try CGI in case
-                // proxy is partially configured, and surface a clear status.
-                session.start(proxy: choice, reason: reason)
-                if DNSManager.detectActiveProxy() != choice {
-                    IITDProxySession.shared.publishExternal(
-                        status: "Enable password-free switching (once) for seamless proxy",
-                        healthOK: false
-                    )
+    private func connectIfCampusReachable(
+        _ choice: ProxyChoice,
+        reason: String,
+        softMiss: Bool = false
+    ) {
+        ProcessRunner.ioQueue.async {
+            let reachable = IITDProxySession.isCampusReachable(for: choice)
+            let leftover = DNSManager.detectActiveProxy() != nil
+            self.queue.async {
+                guard ProxySelection.desiredOn else { return }
+                if !reachable {
+                    if softMiss {
+                        IITDProxySession.shared.noteCampusMiss(
+                            reason: reason,
+                            leftoverProxyPresent: leftover
+                        )
+                    } else {
+                        ProcessRunner.ioQueue.async {
+                            if DNSManager.detectActiveProxy() != nil {
+                                _ = DNSManager.turnProxyOff(allowAdminPrompt: false)
+                            }
+                        }
+                        IITDProxySession.shared.publishExternal(
+                            status: "Off campus — proxy left off. Will retry when IIT proxy is reachable.",
+                            healthOK: false
+                        )
+                    }
+                    return
+                }
+                IITDProxySession.shared.resetCircuitBreaker()
+                if reason.hasPrefix("wake") {
+                    IITDProxySession.shared.recoverAfterWake(reason: reason)
+                    // Success path will cancel remaining wake works via isLoggedIn checks.
+                } else {
+                    IITDProxySession.shared.requestConnect(choice, reason: reason)
                 }
             }
         }

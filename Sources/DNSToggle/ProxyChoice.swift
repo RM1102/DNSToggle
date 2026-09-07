@@ -37,7 +37,7 @@ enum ProxyChoice: String, CaseIterable, Identifiable {
     var cgiURL: String { "https://\(host)/cgi-bin/proxy.cgi" }
 }
 
-/// User intent + last selected proxy. Watchdog keeps CGI in sync with this.
+/// User intent + last selected proxy. Watchdog reconnects only when desiredOn AND campus is reachable.
 enum ProxySelection {
     private static let selectedProxyDefaultsKey = "iitdSelectedProxy"
     private static let desiredOnDefaultsKey = "iitdDesiredProxyOn"
@@ -55,6 +55,7 @@ enum ProxySelection {
     }
 
     /// True when the user wants institute proxy kept logged in (survives relaunch).
+    /// Does NOT force-connect off-campus — campus reachability gates reconnect.
     static var desiredOn: Bool {
         get { UserDefaults.standard.bool(forKey: desiredOnDefaultsKey) }
         set { UserDefaults.standard.set(newValue, forKey: desiredOnDefaultsKey) }
